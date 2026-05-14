@@ -66,11 +66,6 @@ def get_user_models():
 
 
 class SwitchableDualHeadDecoder(nn.Module):
-    """
-    Dual-head decoder that supports routing outputs for cells, organelles, or both.
-    Crucially, it concatenates the outputs when both are requested during inference
-    to avoid breaking the array-stitching logic in core.run_net.
-    """
     def __init__(self, in_channels=256, out_channels=192):
         super().__init__()
         # Head 1: For Cells
@@ -82,20 +77,14 @@ class SwitchableDualHeadDecoder(nn.Module):
         self.active_head = 'cells' # Default to cells
 
     def forward(self, x):
+        # Only return the tensor for the actively selected head during evaluation
         if self.active_head == 'cells':
             return self.cell_head(x)
         elif self.active_head == 'organelles':
             return self.organelle_head(x)
         else:
-            out_c = self.cell_head(x)
-            out_o = self.organelle_head(x)
-            
-            # If set to 'both', return the tuple for training loops
-            if self.training:
-                return out_c, out_o
-            
-            # During evaluation, concatenate to prevent inference stitching crashes
-            return torch.cat([out_c, out_o], dim=1)
+            # If set to 'both', return the tuple (useful later for your custom training loop)
+            return self.cell_head(x), self.organelle_head(x)
 
 
 class CellposeModel():
