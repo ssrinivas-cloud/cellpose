@@ -79,27 +79,12 @@ class CellposeModel():
         pretrained_model_ortho (str): Path or model_name for pretrained cellpose model for ortho views in 3D.
         backbone (str): Type of network ("default" is the standard res-unet, "transformer" for the segformer).
 
-    Methods:
-        __init__(self, gpu=False, pretrained_model=False, model_type=None, diam_mean=30., device=None):
-            Initialize the CellposeModel.
-        
-        eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None, z_axis=None, normalize=True, invert=False, rescale=None, diameter=None, flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None, stitch_threshold=0.0, min_size=15, niter=None, augment=False, tile_overlap=0.1, bsize=256, interp=True, compute_masks=True, progress=None):
-            Segment list of images x, or 4D array - Z x C x Y x X.
-
     """
 
     def __init__(self, gpu=False, pretrained_model="cpsam", model_type=None,
                  diam_mean=None, device=None, nchan=None, use_bfloat16=True):
         """
         Initialize the CellposeModel.
-
-        Parameters:
-            gpu (bool, optional): Whether or not to save model to GPU, will check if GPU available.
-            pretrained_model (str or list of strings, optional): Full path to pretrained cellpose model(s), if None or False, no model loaded.
-            model_type (str, optional): Any model that is available in the GUI, use name in GUI e.g. "livecell" (can be user-trained or model zoo).
-            diam_mean (float, optional): Mean "diameter", 30. is built-in value for "cyto" model; 17. is built-in value for "nuclei" model; if saved in custom model file (cellpose>=2.0) then it will be loaded automatically and overwrite this value.
-            device (torch device, optional): Device used for model running / training (torch.device("cuda") or torch.device("cpu")), overrides gpu input, recommended if you want to use a specific GPU (e.g. torch.device("cuda:1")).
-            use_bfloat16 (bool, optional): Use 16bit float precision instead of 32bit for model weights. Default to 16bit (True).
         """
         if diam_mean is not None:
             models_logger.warning(
@@ -159,59 +144,9 @@ class CellposeModel():
              flow3D_smooth=0, stitch_threshold=0.0, 
              min_size=15, max_size_fraction=0.4, niter=None, 
              augment=False, tile_overlap=0.1, bsize=256, 
-             compute_masks=True, progress=None):
-        """ segment list of images x, or 4D array - Z x 3 x Y x X
-
-        Args:
-            x (list, np.ndarry): can be list of 2D/3D/4D images, or array of 2D/3D/4D images. Images must have 3 channels.
-            batch_size (int, optional): number of 256x256 patches to run simultaneously on the GPU
-                (can make smaller or bigger depending on GPU memory usage). Defaults to 64.
-            resample (bool, optional): run dynamics at original image size (will be slower but create more accurate boundaries). 
-            channel_axis (int, optional): channel axis in element of list x, or of np.ndarray x. 
-                if None, channels dimension is attempted to be automatically determined. Defaults to None.
-            z_axis  (int, optional): z axis in element of list x, or of np.ndarray x. 
-                if None, z dimension is attempted to be automatically determined. Defaults to None.
-            normalize (bool, optional): if True, normalize data so 0.0=1st percentile and 1.0=99th percentile of image intensities in each channel; 
-                can also pass dictionary of parameters (all keys are optional, default values shown): 
-                    - "lowhigh"=None : pass in normalization values for 0.0 and 1.0 as list [low, high] (if not None, all following parameters ignored)
-                    - "sharpen"=0 ; sharpen image with high pass filter, recommended to be 1/4-1/8 diameter of cells in pixels
-                    - "normalize"=True ; run normalization (if False, all following parameters ignored)
-                    - "percentile"=None : pass in percentiles to use as list [perc_low, perc_high]
-                    - "tile_norm_blocksize"=0 ; compute normalization in tiles across image to brighten dark areas, to turn on set to window size in pixels (e.g. 100)
-                    - "norm3D"=True ; compute normalization across entire z-stack rather than plane-by-plane in stitching mode.
-                Defaults to True.
-            invert (bool, optional): invert image pixel intensity before running network. Defaults to False.
-            rescale (float, optional): resize factor for each image, if None, set to 1.0;
-                (only used if diameter is None). Defaults to None.
-            diameter (float or list of float, optional): diameters are used to rescale the image to 30 pix cell diameter.
-            flow_threshold (float, optional): flow error threshold (all cells with errors below threshold are kept) (not used for 3D). Defaults to 0.4.
-            cellprob_threshold (float, optional): all pixels with value above threshold kept for masks, decrease to find more and larger masks. Defaults to 0.0.
-            do_3D (bool, optional): set to True to run 3D segmentation on 3D/4D image input. Defaults to False.
-            flow3D_smooth (int or float or list of (int or float), optional): if do_3D and flow3D_smooth>0, smooth flows with gaussian filter of this stddev. If you are seeing increased fragmentation along the Z axis, or ring-artifacts, you can specify increased smoothing in the z-axis by providing a list, e.g. `flow3D_smooth = [2, 1, 1]`. List smooths the ZYX axes independently and must be length 3. Defaults to 0.
-            anisotropy (float, optional): for 3D segmentation, optional rescaling factor (e.g. set to 2.0 if Z is sampled half as dense as X or Y). Defaults to None.
-            stitch_threshold (float, optional): if stitch_threshold>0.0 and not do_3D, masks are stitched in 3D to return volume segmentation. Defaults to 0.0.
-            min_size (int, optional): all ROIs below this size, in pixels, will be discarded. Defaults to 15.
-            max_size_fraction (float, optional): max_size_fraction (float, optional): Masks larger than max_size_fraction of
-                total image size are removed. Default is 0.4.
-            niter (int, optional): number of iterations for dynamics computation. if None, it is set proportional to the diameter. Defaults to None.
-            augment (bool, optional): tiles image with overlapping tiles and flips overlapped regions to augment. Defaults to False.
-            tile_overlap (float, optional): fraction of overlap of tiles when computing flows. Defaults to 0.1.
-            bsize (int, optional): block size for tiles, recommended to keep at 256, like in training. Defaults to 256.
-            interp (bool, optional): interpolate during 2D dynamics (not available in 3D) . Defaults to True.
-            compute_masks (bool, optional): Whether or not to compute dynamics and return masks. Returns empty array if False. Defaults to True.
-            progress (QProgressBar, optional): pyqt progress bar. Defaults to None.
-
-        Returns:
-            A tuple containing (masks, flows, styles): 
-            masks (list of 2D arrays or single 3D array): Labelled image, where 0=no masks; 1,2,...=mask labels;
-            flows (list of lists 2D arrays or list of 3D arrays): 
-                flows[k][0] = XY flow in HSV 0-255; 
-                flows[k][1] = XY flows at each pixel; 
-                flows[k][2] = cell probability (if > cellprob_threshold, pixel used for dynamics); 
-                flows[k][3] = final pixel locations after Euler integration; 
-            styles (list of 1D arrays of length 256 or single 1D array): Style vector containing only zeros. Retained for compaibility with CP3. 
-            
-        """
+             compute_masks=True, progress=None,
+             active_head='cells'):
+        """ segment list of images x, or 4D array - Z x 3 x Y x X """
         if isinstance(x, list) or x.squeeze().ndim == 5:
             self.timing = []
             masks, styles, flows = [], [], []
@@ -244,7 +179,8 @@ class CellposeModel():
                     stitch_threshold=stitch_threshold, 
                     flow3D_smooth=flow3D_smooth,
                     progress=progress, 
-                    niter=niter)
+                    niter=niter,
+                    active_head=active_head)
                 masks.append(maski)
                 flows.append(flowi)
                 styles.append(stylei)
@@ -292,7 +228,11 @@ class CellposeModel():
         if do_normalization:
             x = transforms.normalize_img(x, **normalize_params)
 
-        dP, cellprob, styles = self._run_net(
+        # Set the active head on the decoder
+        if hasattr(self.net, 'out'):
+            self.net.out.active_head = active_head
+            
+        network_outputs = self._run_net(
             x,
             resample=resample,
             rescale=image_scaling,
@@ -301,39 +241,55 @@ class CellposeModel():
             tile_overlap=tile_overlap, 
             bsize=bsize,
             do_3D=do_3D, 
-            anisotropy=anisotropy)
+            anisotropy=anisotropy,
+            active_head=active_head)
 
-        if do_3D and flow3D_smooth:
-            if isinstance(flow3D_smooth, (int, float)):
-                flow3D_smooth = [flow3D_smooth]*3 
-            if isinstance(flow3D_smooth, list) and len(flow3D_smooth) == 1:
-                flow3D_smooth = flow3D_smooth*3
-            if len(flow3D_smooth) == 3 and any(v > 0 for v in flow3D_smooth):
-                models_logger.info(f"smoothing flows with ZYX sigma={flow3D_smooth}")
-                dP = gaussian_filter(dP, [0, *flow3D_smooth])
-            else: 
-                models_logger.warning(f"Could not do flow smoothing with {flow3D_smooth} either because its len was not 3 or no items were > 0, skipping flow3D_smoothing")
-            torch.cuda.empty_cache()
-            gc.collect()
+        all_masks = []
+        all_flows = []
+        all_styles = []
 
-        if compute_masks:
-            # use user niter if specified, otherwise scale niter (200) with diameter
-            niter_scale = 1 if image_scaling is None else image_scaling
-            niter = int(200/niter_scale) if niter is None or niter == 0 else niter
-            masks = self._compute_masks(x.shape, dP, cellprob, 
-                                        flow_threshold=flow_threshold,
-                                        cellprob_threshold=cellprob_threshold, 
-                                        min_size=min_size,
-                                        max_size_fraction=max_size_fraction, 
-                                        niter=niter,
-                                        stitch_threshold=stitch_threshold, 
-                                        do_3D=do_3D)
+        heads_to_process = ['cells', 'organelles'] if active_head == 'both' else [active_head]
+
+        for head in heads_to_process:
+            dP, cellprob, styles = network_outputs[head]
+
+            if do_3D and flow3D_smooth:
+                if isinstance(flow3D_smooth, (int, float)):
+                    flow3D_smooth = [flow3D_smooth]*3 
+                if isinstance(flow3D_smooth, list) and len(flow3D_smooth) == 1:
+                    flow3D_smooth = flow3D_smooth*3
+                if len(flow3D_smooth) == 3 and any(v > 0 for v in flow3D_smooth):
+                    models_logger.info(f"smoothing flows with ZYX sigma={flow3D_smooth}")
+                    dP = gaussian_filter(dP, [0, *flow3D_smooth])
+                else: 
+                    models_logger.warning(f"Could not do flow smoothing with {flow3D_smooth} either because its len was not 3 or no items were > 0, skipping flow3D_smoothing")
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            if compute_masks:
+                # use user niter if specified, otherwise scale niter (200) with diameter
+                niter_scale = 1 if image_scaling is None else image_scaling
+                niter_val = int(200/niter_scale) if niter is None or niter == 0 else niter
+                masks = self._compute_masks(x.shape, dP, cellprob, 
+                                            flow_threshold=flow_threshold,
+                                            cellprob_threshold=cellprob_threshold, 
+                                            min_size=min_size,
+                                            max_size_fraction=max_size_fraction, 
+                                            niter=niter_val,
+                                            stitch_threshold=stitch_threshold, 
+                                            do_3D=do_3D)
+            else:
+                masks = np.zeros(0) #pass back zeros if not compute_masks
+            
+            masks, dP, cellprob = masks.squeeze(), dP.squeeze(), cellprob.squeeze()
+            all_masks.append(masks)
+            all_flows.append([plot.dx_to_circ(dP), dP, cellprob])
+            all_styles.append(styles)
+
+        if active_head == 'both':
+            return np.stack(all_masks, axis=0), all_flows, all_styles
         else:
-            masks = np.zeros(0) #pass back zeros if not compute_masks
-        
-        masks, dP, cellprob = masks.squeeze(), dP.squeeze(), cellprob.squeeze()
-
-        return masks, [plot.dx_to_circ(dP), dP, cellprob], styles
+            return all_masks[0], all_flows[0], all_styles[0]
     
 
     def _run_net(self, x, 
@@ -344,7 +300,8 @@ class CellposeModel():
                  tile_overlap=0.1,
                  bsize=256, 
                  anisotropy=1.0, 
-                 do_3D=False):
+                 do_3D=False,
+                 active_head='cells'):
         """ run network on image x """
         tic = time.time()
         shape = x.shape
@@ -361,38 +318,55 @@ class CellposeModel():
                 x = transforms.resize_image(x.transpose(1,0,2,3),
                                         Ly=int(Lz*anisotropy*rescale), 
                                         Lx=int(Lx*rescale)).transpose(1,0,2,3)
-            yf, styles = run_3D(self.net, x,
+            yf_raw, styles = run_3D(self.net, x,
                                 batch_size=batch_size, augment=augment,  
                                 tile_overlap=tile_overlap, 
                                 bsize=bsize
                                 )
-            if resample:
-                if rescale != 1.0 or Lz != yf.shape[0]:
-                    models_logger.info("resizing 3D flows and cellprobl to original image size")
-                    if rescale != 1.0:
-                        yf = transforms.resize_image(yf, Ly=Ly, Lx=Lx)
-                    if Lz != yf.shape[0]:
-                        yf = transforms.resize_image(yf.transpose(1, 0, 2, 3), Ly=Lz, Lx=Lx).transpose(1, 0, 2, 3)
-            cellprob = yf[..., -1]
-            dP = yf[..., :-1].transpose((3, 0, 1, 2))
         else:
-            yf, styles = run_net(self.net, x, bsize=bsize, augment=augment,
+            yf_raw, styles = run_net(self.net, x, bsize=bsize, augment=augment,
                                 batch_size=batch_size,  
                                 tile_overlap=tile_overlap, 
                                 rsz=rescale if rescale !=1.0 else None)
+
+        # Slice dual-head outputs back into individual tensors if needed
+        yf_dict = {}
+        if active_head == 'both':
+            midpoint = yf_raw.shape[-1] // 2 
+            yf_dict['cells'] = yf_raw[..., :midpoint]
+            yf_dict['organelles'] = yf_raw[..., midpoint:]
+        else:
+            yf_dict[active_head] = yf_raw
+
+        outputs = {}
+        for head, yf in yf_dict.items():
             if resample:
-                if rescale != 1.0:
-                    yf = transforms.resize_image(yf, shape[1], shape[2])
-            cellprob = yf[..., -1]
-            dP = yf[..., -3:-1].transpose((3, 0, 1, 2))
-        
-        styles = styles.squeeze()
+                if do_3D:
+                    if rescale != 1.0 or Lz != yf.shape[0]:
+                        models_logger.info(f"resizing 3D flows and cellprob to original image size for head: {head}")
+                        if rescale != 1.0:
+                            yf = transforms.resize_image(yf, Ly=Ly, Lx=Lx)
+                        if Lz != yf.shape[0]:
+                            yf = transforms.resize_image(yf.transpose(1, 0, 2, 3), Ly=Lz, Lx=Lx).transpose(1, 0, 2, 3)
+                else:
+                    if rescale != 1.0:
+                        yf = transforms.resize_image(yf, shape[1], shape[2])
+            
+            # Extract cellprob and dP
+            if do_3D:
+                cellprob = yf[..., -1]
+                dP = yf[..., :-1].transpose((3, 0, 1, 2))
+            else:
+                cellprob = yf[..., -1]
+                dP = yf[..., -3:-1].transpose((3, 0, 1, 2))
+            
+            outputs[head] = (dP, cellprob, styles.squeeze() if isinstance(styles, np.ndarray) else styles)
 
         net_time = time.time() - tic
         if nimg > 1:
             models_logger.info("network run in %2.2fs" % (net_time))
 
-        return dP, cellprob, styles
+        return outputs
     
     def _compute_masks(self, shape, dP, cellprob, flow_threshold=0.4, cellprob_threshold=0.0,
                        min_size=15, max_size_fraction=0.4, niter=None,
