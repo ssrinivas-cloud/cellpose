@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import trange
 import torch
+import torch.nn as nn
 from scipy.ndimage import gaussian_filter
 import gc
 import cv2
@@ -64,6 +65,39 @@ def get_user_models():
     return model_strings
 
 
+class SwitchableDualHeadDecoder(nn.Module):
+    """
+    Dual-head decoder that supports routing outputs for cells, organelles, or both.
+    Crucially, it concatenates the outputs when both are requested during inference
+    to avoid breaking the array-stitching logic in core.run_net.
+    """
+    def __init__(self, in_channels=256, out_channels=192):
+        super().__init__()
+        # Head 1: For Cells
+        self.cell_head = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        # Head 2: For Organelles
+        self.organelle_head = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        
+        # The switch mechanism
+        self.active_head = 'cells' # Default to cells
+
+    def forward(self, x):
+        if self.active_head == 'cells':
+            return self.cell_head(x)
+        elif self.active_head == 'organelles':
+            return self.organelle_head(x)
+        else:
+            out_c = self.cell_head(x)
+            out_o = self.organelle_head(x)
+            
+            # If set to 'both', return the tuple for training loops
+            if self.training:
+                return out_c, out_o
+            
+            # During evaluation, concatenate to prevent inference stitching crashes
+            return torch.cat([out_c, out_o], dim=1)
+
+
 class CellposeModel():
     """
     Class representing a Cellpose model.
@@ -79,12 +113,27 @@ class CellposeModel():
         pretrained_model_ortho (str): Path or model_name for pretrained cellpose model for ortho views in 3D.
         backbone (str): Type of network ("default" is the standard res-unet, "transformer" for the segformer).
 
+    Methods:
+        __init__(self, gpu=False, pretrained_model=False, model_type=None, diam_mean=30., device=None):
+            Initialize the CellposeModel.
+        
+        eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None, z_axis=None, normalize=True, invert=False, rescale=None, diameter=None, flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None, stitch_threshold=0.0, min_size=15, niter=None, augment=False, tile_overlap=0.1, bsize=256, interp=True, compute_masks=True, progress=None):
+            Segment list of images x, or 4D array - Z x C x Y x X.
+
     """
 
     def __init__(self, gpu=False, pretrained_model="cpsam", model_type=None,
                  diam_mean=None, device=None, nchan=None, use_bfloat16=True):
         """
         Initialize the CellposeModel.
+
+        Parameters:
+            gpu (bool, optional): Whether or not to save model to GPU, will check if GPU available.
+            pretrained_model (str or list of strings, optional): Full path to pretrained cellpose model(s), if None or False, no model loaded.
+            model_type (str, optional): Any model that is available in the GUI, use name in GUI e.g. "livecell" (can be user-trained or model zoo).
+            diam_mean (float, optional): Mean "diameter", 30. is built-in value for "cyto" model; 17. is built-in value for "nuclei" model; if saved in custom model file (cellpose>=2.0) then it will be loaded automatically and overwrite this value.
+            device (torch device, optional): Device used for model running / training (torch.device("cuda") or torch.device("cpu")), overrides gpu input, recommended if you want to use a specific GPU (e.g. torch.device("cuda:1")).
+            use_bfloat16 (bool, optional): Use 16bit float precision instead of 32bit for model weights. Default to 16bit (True).
         """
         if diam_mean is not None:
             models_logger.warning(
@@ -146,7 +195,59 @@ class CellposeModel():
              augment=False, tile_overlap=0.1, bsize=256, 
              compute_masks=True, progress=None,
              active_head='cells'):
-        """ segment list of images x, or 4D array - Z x 3 x Y x X """
+        """ segment list of images x, or 4D array - Z x 3 x Y x X
+
+        Args:
+            x (list, np.ndarry): can be list of 2D/3D/4D images, or array of 2D/3D/4D images. Images must have 3 channels.
+            batch_size (int, optional): number of 256x256 patches to run simultaneously on the GPU
+                (can make smaller or bigger depending on GPU memory usage). Defaults to 64.
+            resample (bool, optional): run dynamics at original image size (will be slower but create more accurate boundaries). 
+            channel_axis (int, optional): channel axis in element of list x, or of np.ndarray x. 
+                if None, channels dimension is attempted to be automatically determined. Defaults to None.
+            z_axis  (int, optional): z axis in element of list x, or of np.ndarray x. 
+                if None, z dimension is attempted to be automatically determined. Defaults to None.
+            normalize (bool, optional): if True, normalize data so 0.0=1st percentile and 1.0=99th percentile of image intensities in each channel; 
+                can also pass dictionary of parameters (all keys are optional, default values shown): 
+                    - "lowhigh"=None : pass in normalization values for 0.0 and 1.0 as list [low, high] (if not None, all following parameters ignored)
+                    - "sharpen"=0 ; sharpen image with high pass filter, recommended to be 1/4-1/8 diameter of cells in pixels
+                    - "normalize"=True ; run normalization (if False, all following parameters ignored)
+                    - "percentile"=None : pass in percentiles to use as list [perc_low, perc_high]
+                    - "tile_norm_blocksize"=0 ; compute normalization in tiles across image to brighten dark areas, to turn on set to window size in pixels (e.g. 100)
+                    - "norm3D"=True ; compute normalization across entire z-stack rather than plane-by-plane in stitching mode.
+                Defaults to True.
+            invert (bool, optional): invert image pixel intensity before running network. Defaults to False.
+            rescale (float, optional): resize factor for each image, if None, set to 1.0;
+                (only used if diameter is None). Defaults to None.
+            diameter (float or list of float, optional): diameters are used to rescale the image to 30 pix cell diameter.
+            flow_threshold (float, optional): flow error threshold (all cells with errors below threshold are kept) (not used for 3D). Defaults to 0.4.
+            cellprob_threshold (float, optional): all pixels with value above threshold kept for masks, decrease to find more and larger masks. Defaults to 0.0.
+            do_3D (bool, optional): set to True to run 3D segmentation on 3D/4D image input. Defaults to False.
+            flow3D_smooth (int or float or list of (int or float), optional): if do_3D and flow3D_smooth>0, smooth flows with gaussian filter of this stddev. If you are seeing increased fragmentation along the Z axis, or ring-artifacts, you can specify increased smoothing in the z-axis by providing a list, e.g. `flow3D_smooth = [2, 1, 1]`. List smooths the ZYX axes independently and must be length 3. Defaults to 0.
+            anisotropy (float, optional): for 3D segmentation, optional rescaling factor (e.g. set to 2.0 if Z is sampled half as dense as X or Y). Defaults to None.
+            stitch_threshold (float, optional): if stitch_threshold>0.0 and not do_3D, masks are stitched in 3D to return volume segmentation. Defaults to 0.0.
+            min_size (int, optional): all ROIs below this size, in pixels, will be discarded. Defaults to 15.
+            max_size_fraction (float, optional): max_size_fraction (float, optional): Masks larger than max_size_fraction of
+                total image size are removed. Default is 0.4.
+            niter (int, optional): number of iterations for dynamics computation. if None, it is set proportional to the diameter. Defaults to None.
+            augment (bool, optional): tiles image with overlapping tiles and flips overlapped regions to augment. Defaults to False.
+            tile_overlap (float, optional): fraction of overlap of tiles when computing flows. Defaults to 0.1.
+            bsize (int, optional): block size for tiles, recommended to keep at 256, like in training. Defaults to 256.
+            interp (bool, optional): interpolate during 2D dynamics (not available in 3D) . Defaults to True.
+            compute_masks (bool, optional): Whether or not to compute dynamics and return masks. Returns empty array if False. Defaults to True.
+            progress (QProgressBar, optional): pyqt progress bar. Defaults to None.
+            active_head (str, optional): Target decoder head ('cells', 'organelles', or 'both'). Defaults to 'cells'.
+
+        Returns:
+            A tuple containing (masks, flows, styles): 
+            masks (list of 2D arrays or single 3D array): Labelled image, where 0=no masks; 1,2,...=mask labels;
+            flows (list of lists 2D arrays or list of 3D arrays): 
+                flows[k][0] = XY flow in HSV 0-255; 
+                flows[k][1] = XY flows at each pixel; 
+                flows[k][2] = cell probability (if > cellprob_threshold, pixel used for dynamics); 
+                flows[k][3] = final pixel locations after Euler integration; 
+            styles (list of 1D arrays of length 256 or single 1D array): Style vector containing only zeros. Retained for compaibility with CP3. 
+            
+        """
         if isinstance(x, list) or x.squeeze().ndim == 5:
             self.timing = []
             masks, styles, flows = [], [], []
