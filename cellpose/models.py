@@ -191,7 +191,7 @@ class CellposeModel():
             model_dtype = next(self.net.parameters()).dtype
             self.net.out = SwitchableDualHeadDecoder(
                 in_channels=256, 
-                out_channels=3 # Matches the standard 3 outputs needed by Cellpose (dY, dX, cellprob)
+                out_channels=192 # Matches the standard 3 outputs needed by Cellpose (dY, dX, cellprob)
             ).to(device=self.device, dtype=model_dtype)
             
             # Note: If running purely for inference, you would load your custom weights here:
