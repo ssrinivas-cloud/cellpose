@@ -123,7 +123,7 @@ class CellposeModel():
     """
 
     def __init__(self, gpu=False, pretrained_model="cpsam", model_type=None,
-                 diam_mean=None, device=None, nchan=None, use_bfloat16=True):
+                 diam_mean=None, device=None, nchan=None, use_bfloat16=True, manual=True):
         """
         Initialize the CellposeModel.
 
@@ -134,6 +134,7 @@ class CellposeModel():
             diam_mean (float, optional): Mean "diameter", 30. is built-in value for "cyto" model; 17. is built-in value for "nuclei" model; if saved in custom model file (cellpose>=2.0) then it will be loaded automatically and overwrite this value.
             device (torch device, optional): Device used for model running / training (torch.device("cuda") or torch.device("cpu")), overrides gpu input, recommended if you want to use a specific GPU (e.g. torch.device("cuda:1")).
             use_bfloat16 (bool, optional): Use 16bit float precision instead of 32bit for model weights. Default to 16bit (True).
+            manual (bool, optional): If False, automatically freezes the backbone and injects the Dual Head. Default is True.
         """
         if diam_mean is not None:
             models_logger.warning(
@@ -185,6 +186,27 @@ class CellposeModel():
                 raise FileNotFoundError('model file not recognized')
             cache_CPSAM_model_path()
             self.net.load_model(self.pretrained_model, device=self.device)
+        
+        # --- AUTOMATIC ARCHITECTURE INJECTION & FREEZING ---
+        if not manual:
+            models_logger.info("manual=False: Freezing backbone and injecting SwitchableDualHeadDecoder.")
+            
+            # 1. Freeze the massive ViT transformer, keep neck and out trainable
+            for name, param in self.net.named_parameters():
+                if 'neck' in name or 'out' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+            
+            # 2. Inject the Dual-Head into the Cellpose model
+            model_dtype = next(self.net.parameters()).dtype
+            self.net.out = SwitchableDualHeadDecoder(
+                in_channels=256, 
+                out_channels=3 # Matches the standard 3 outputs needed by Cellpose (dY, dX, cellprob)
+            ).to(device=self.device, dtype=model_dtype)
+            
+            # Note: If running purely for inference, you would load your custom weights here:
+            # self.net.out.load_state_dict(torch.load("my_dual_head_weights.pth"))
         
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
