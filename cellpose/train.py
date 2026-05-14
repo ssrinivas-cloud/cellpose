@@ -7,8 +7,9 @@ from pathlib import Path
 import torch
 from torch import nn
 from tqdm import trange
-
 import logging
+
+from huggingface_hub import HfApi
 
 train_logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ def _reshape_norm(data, channel_axis=None, normalize_params={"normalize": False}
     return data
 
 def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
-               normalize_params={"normalize": False}):
+               normalize_params={"normalize": False}, tasks=None):
     """
     Get a batch of images and labels.
 
@@ -97,9 +98,10 @@ def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
         files (list or None): List of file paths for images.
         labels_files (list or None): List of file paths for labels.
         normalize_params (dict): Dictionary of parameters for image normalization (will be faster, if loading from files to pre-normalize).
+        tasks (list or None): List of task tags (0 for cell, 1 for organelle).
 
     Returns:
-        tuple: A tuple containing two lists: the batch of images and the batch of labels.
+        tuple: A tuple containing lists: the batch of images, labels, and tasks.
     """
     if data is None:
         lbls = None
@@ -110,7 +112,11 @@ def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
     else:
         imgs = [data[i] for i in inds]
         lbls = [labels[i][1:] for i in inds]
-    return imgs, lbls
+        
+    # Grab the task identifiers for this specific batch
+    batch_tasks = [tasks[i] for i in inds] if tasks is not None else [0] * len(inds)
+    
+    return imgs, lbls, batch_tasks
 
 def _reshape_norm_save(files, channels=None, channel_axis=None,
                        normalize_params={"normalize": False}):
@@ -119,8 +125,7 @@ def _reshape_norm_save(files, channels=None, channel_axis=None,
     for f in trange(files):
         td = io.imread(f)
         if channels is not None:
-            td = convert_image(td, channels=channels,
-                                          channel_axis=channel_axis)
+            td = convert_image(td, channels=channels, channel_axis=channel_axis)
             td = td.transpose(2, 0, 1)
         if normalize_params["normalize"]:
             td = normalize_img(td, normalize=normalize_params, axis=0)
@@ -128,12 +133,6 @@ def _reshape_norm_save(files, channels=None, channel_axis=None,
         io.imsave(fnew, td)
         files_new.append(fnew)
     return files_new
-    # else:
-    #     train_files = reshape_norm_save(train_files, channels=channels,
-    #                     channel_axis=channel_axis, normalize_params=normalize_params)
-    # elif test_files is not None:
-    #     test_files = reshape_norm_save(test_files, channels=channels,
-    #                     channel_axis=channel_axis, normalize_params=normalize_params)
 
 
 def _process_train_test(train_data=None, train_labels=None, train_files=None,
@@ -144,29 +143,6 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
                         channel_axis=None, device=None):
     """
     Process train and test data.
-
-    Args:
-        train_data (list or None): List of training data arrays.
-        train_labels (list or None): List of training label arrays.
-        train_files (list or None): List of training file paths.
-        train_labels_files (list or None): List of training label file paths.
-        train_probs (ndarray or None): Array of training probabilities.
-        test_data (list or None): List of test data arrays.
-        test_labels (list or None): List of test label arrays.
-        test_files (list or None): List of test file paths.
-        test_labels_files (list or None): List of test label file paths.
-        test_probs (ndarray or None): Array of test probabilities.
-        load_files (bool): Whether to load data from files.
-        min_train_masks (int): Minimum number of masks required for training images.
-        compute_flows (bool): Whether to compute flows.
-        channels (list or None): List of channel indices to use.
-        channel_axis (int or None): Axis of channel dimension.
-        rgb (bool): Convert training/testing images to RGB.
-        normalize_params (dict): Dictionary of normalization parameters.
-        device (torch.device): Device to use for computation.
-
-    Returns:
-        tuple: A tuple containing the processed train and test data and sampling probabilities and diameters.
     """
     if device == None:
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('mps') if torch.backends.mps.is_available() else None
@@ -307,50 +283,16 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
 
 
 def train_seg(net, train_data=None, train_labels=None, train_files=None,
-              train_labels_files=None, train_probs=None, test_data=None,
-              test_labels=None, test_files=None, test_labels_files=None,
-              test_probs=None, channel_axis=None,
+              train_labels_files=None, train_probs=None, train_tasks=None, 
+              test_data=None, test_labels=None, test_files=None, test_labels_files=None,
+              test_probs=None, test_tasks=None, channel_axis=None,
               load_files=True, batch_size=1, learning_rate=1e-5, SGD=False,
               n_epochs=100, weight_decay=0.1, normalize=True, compute_flows=False,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
-              min_train_masks=5, model_name=None, class_weights=None):
-    """
-    Train the network with images for segmentation.
-
-    Args:
-        net (object): The network model to train. If `net` is a bfloat16 model it will be converted to float32 for training. The saved models will be in float32, but the original model will be returned as the original dtype for consistency. 
-        train_data (List[np.ndarray], optional): List of arrays (2D or 3D) - images for training. Defaults to None.
-        train_labels (List[np.ndarray], optional): List of arrays (2D or 3D) - labels for train_data, where 0=no masks; 1,2,...=mask labels. Defaults to None.
-        train_files (List[str], optional): List of strings - file names for images in train_data (to save flows for future runs). Defaults to None.
-        train_labels_files (list or None): List of training label file paths. Defaults to None.
-        train_probs (List[float], optional): List of floats - probabilities for each image to be selected during training. Defaults to None.
-        test_data (List[np.ndarray], optional): List of arrays (2D or 3D) - images for testing. Defaults to None.
-        test_labels (List[np.ndarray], optional): List of arrays (2D or 3D) - labels for test_data, where 0=no masks; 1,2,...=mask labels. Defaults to None.
-        test_files (List[str], optional): List of strings - file names for images in test_data (to save flows for future runs). Defaults to None.
-        test_labels_files (list or None): List of test label file paths. Defaults to None.
-        test_probs (List[float], optional): List of floats - probabilities for each image to be selected during testing. Defaults to None.
-        load_files (bool, optional): Boolean - whether to load images and labels from files. Defaults to True.
-        batch_size (int, optional): Integer - number of patches to run simultaneously on the GPU. Defaults to 1.
-        learning_rate (float or List[float], optional): Float or list/np.ndarray - learning rate for training. Defaults to 1e-5.
-        n_epochs (int, optional): Integer - number of times to go through the whole training set during training. Defaults to 100.
-        weight_decay (float, optional): Float - weight decay for the optimizer. Defaults to 0.1.
-        SGD (bool, optional): Deprecated in v4.0.1+ - AdamW always used.
-        normalize (bool or dict, optional): Boolean or dictionary - whether to normalize the data. Defaults to True.
-        compute_flows (bool, optional): Boolean - whether to compute flows during training. Defaults to False.
-        save_path (str, optional): String - where to save the trained model. Defaults to None.
-        save_every (int, optional): Integer - save the network every [save_every] epochs. Defaults to 100.
-        save_each (bool, optional): Boolean - save the network to a new filename at every [save_each] epoch. Defaults to False.
-        nimg_per_epoch (int, optional): Integer - minimum number of images to train on per epoch. Defaults to None.
-        nimg_test_per_epoch (int, optional): Integer - minimum number of images to test on per epoch. Defaults to None.
-        rescale (bool, optional): Boolean - whether or not to rescale images during training. Defaults to False.
-        min_train_masks (int, optional): Integer - minimum number of masks an image must have to use in the training set. Defaults to 5.
-        model_name (str, optional): String - name of the network. Defaults to None.
-
-    Returns:
-        tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
-       
-    """
+              min_train_masks=5, model_name=None, class_weights=None,
+              hf_repo_id=None, hf_token=None):
+    
     if SGD:
         train_logger.warning("SGD is deprecated, using AdamW instead")
 
@@ -358,7 +300,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     original_net_dtype = net.dtype 
     if net.dtype == torch.bfloat16:
-        # NOTE: this produces a side effect of returning a network that is not of a guaranteed dtype \
         train_logger.info(">>> converting bfloat16 network to float32 for training")
         net.dtype = torch.float32
 
@@ -384,6 +325,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     (train_data, train_labels, train_files, train_labels_files, train_probs, diam_train,
      test_data, test_labels, test_files, test_labels_files, test_probs, diam_test,
      normed) = out
+     
     # already normalized, do not normalize during training
     if normed:
         kwargs = {}
@@ -431,6 +373,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
+    
     for iepoch in range(n_epochs):
         np.random.seed(iepoch)
         if nimg != nimg_per_epoch:
@@ -440,35 +383,61 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         else:
             # otherwise use all images
             rperm = np.random.permutation(np.arange(0, nimg))
+            
         for param_group in optimizer.param_groups:
             param_group["lr"] = LR[iepoch] # set learning rate
+            
         net.train()
         for k in range(0, nimg_per_epoch, batch_size):
             kend = min(k + batch_size, nimg_per_epoch)
             inds = rperm[k:kend]
-            imgs, lbls = _get_batch(inds, data=train_data, labels=train_labels,
-                                    files=train_files, labels_files=train_labels_files,
-                                    **kwargs)
+            
+            # Fetch batch tasks alongside images and labels
+            imgs, lbls, batch_tasks = _get_batch(inds, data=train_data, labels=train_labels,
+                                                 files=train_files, labels_files=train_labels_files,
+                                                 tasks=train_tasks, **kwargs)
             diams = np.array([diam_train[i] for i in inds])
             rsc = diams / net.diam_mean.item() if rescale else np.ones(
                 len(diams), "float32")
+                
             # augmentations
             imgi, lbl = random_rotate_and_resize(imgs, Y=lbls, rescale=rsc,
-                                                            scale_range=scale_range,
-                                                            xy=(bsize, bsize))[:2]
+                                                 scale_range=scale_range,
+                                                 xy=(bsize, bsize))[:2]
+                                                 
             # network and loss optimization
             X = torch.from_numpy(imgi).to(device)
             lbl = torch.from_numpy(lbl).to(device)
+            
+            # Convert tasks to tensor for boolean masking
+            batch_tasks_tensor = torch.tensor(batch_tasks, device=device)
+            cell_mask = (batch_tasks_tensor == 0)
+            org_mask = (batch_tasks_tensor == 1)
 
             with torch.autocast(device_type=device.type, dtype=net.dtype):
-                y = net(X)[0]
-            loss = _loss_fn_seg(lbl, y, device)
-            if y.shape[1] > 3:
-                loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                loss += loss3
+                # Unpack the two heads from the network
+                y_cell, y_org = net(X)
+                
+            loss = torch.tensor(0.0, device=device)
+            
+            # Route cell loss
+            if cell_mask.any():
+                loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
+                if y_cell.shape[1] > 3:
+                    loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
+                loss += loss_cell
+                
+            # Route organelle loss
+            if org_mask.any():
+                loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
+                if y_org.shape[1] > 3:
+                    loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
+                loss += loss_org
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
             train_loss = loss.item()
             train_loss *= len(imgi)
 
@@ -477,6 +446,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             nsum += len(imgi)
             # per epoch training loss
             train_losses[iepoch] += train_loss
+            
         train_losses[iepoch] /= nimg_per_epoch
 
         if iepoch == 5 or iepoch % 10 == 0:
@@ -488,34 +458,54 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                                              size=(nimg_test_per_epoch,), p=test_probs)
                 else:
                     rperm = np.random.permutation(np.arange(0, nimg_test))
+                    
                 for ibatch in range(0, len(rperm), batch_size):
                     with torch.no_grad():
                         net.eval()
                         inds = rperm[ibatch:ibatch + batch_size]
-                        imgs, lbls = _get_batch(inds, data=test_data,
-                                                labels=test_labels, files=test_files,
-                                                labels_files=test_labels_files,
-                                                **kwargs)
+                        
+                        imgs, lbls, batch_tasks = _get_batch(inds, data=test_data,
+                                                             labels=test_labels, files=test_files,
+                                                             labels_files=test_labels_files,
+                                                             tasks=test_tasks, **kwargs)
                         diams = np.array([diam_test[i] for i in inds])
                         rsc = diams / net.diam_mean.item() if rescale else np.ones(
                             len(diams), "float32")
                         imgi, lbl = random_rotate_and_resize(
                             imgs, Y=lbls, rescale=rsc, scale_range=scale_range,
                             xy=(bsize, bsize))[:2]
+                            
                         X = torch.from_numpy(imgi).to(device)
                         lbl = torch.from_numpy(lbl).to(device)
+                        
+                        batch_tasks_tensor = torch.tensor(batch_tasks, device=device)
+                        cell_mask = (batch_tasks_tensor == 0)
+                        org_mask = (batch_tasks_tensor == 1)
 
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
-                            y = net(X)[0]
-                        loss = _loss_fn_seg(lbl, y, device)
-                        if y.shape[1] > 3:
-                            loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                            loss += loss3            
+                            y_cell, y_org = net(X)
+                            
+                        loss = torch.tensor(0.0, device=device)
+                        
+                        if cell_mask.any():
+                            loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
+                            if y_cell.shape[1] > 3:
+                                loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
+                            loss += loss_cell
+                            
+                        if org_mask.any():
+                            loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
+                            if y_org.shape[1] > 3:
+                                loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
+                            loss += loss_org
+                        
                         test_loss = loss.item()
                         test_loss *= len(imgi)
                         lavgt += test_loss
+                        
                 lavgt /= len(rperm)
                 test_losses[iepoch] = lavgt
+                
             lavg /= nsum
             train_logger.info(
                 f"{iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
@@ -531,8 +521,24 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             net.save_model(filename0)
     
     net.save_model(filename)
+    
     if original_net_dtype != torch.float32:
         train_logger.info(f">>> converting network back to {original_net_dtype} after training")
         net.dtype = original_net_dtype
+
+    # --- Hugging Face Upload Logic ---
+    if hf_repo_id and hf_token:
+        train_logger.info(f">>> Uploading model to Hugging Face Hub: {hf_repo_id}")
+        try:
+            api = HfApi(token=hf_token)
+            api.upload_file(
+                path_or_fileobj=str(filename),
+                path_in_repo=f"models/{model_name}",
+                repo_id=hf_repo_id,
+                repo_type="model"
+            )
+            train_logger.info(">>> Upload successful!")
+        except Exception as e:
+            train_logger.error(f">>> Failed to upload to Hugging Face: {e}")
 
     return filename, train_losses, test_losses
