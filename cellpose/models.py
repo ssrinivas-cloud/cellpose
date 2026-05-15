@@ -111,7 +111,7 @@ class CellposeModel():
 
     """
 
-    def __init__(self, gpu=False, pretrained_model="cpsam", model_type=None,
+    def __init__(self, gpu=False, pretrained_model="cpsam", custom_weights=None, model_type=None,
                  diam_mean=None, device=None, nchan=None, use_bfloat16=True, manual=True):
         """
         Initialize the CellposeModel.
@@ -119,6 +119,7 @@ class CellposeModel():
         Parameters:
             gpu (bool, optional): Whether or not to save model to GPU, will check if GPU available.
             pretrained_model (str or list of strings, optional): Full path to pretrained cellpose model(s), if None or False, no model loaded.
+            custom_weights (str, optional): Full path to fine-tuned post-architecture weights. Overrides pretrained_model loading.
             model_type (str, optional): Any model that is available in the GUI, use name in GUI e.g. "livecell" (can be user-trained or model zoo).
             diam_mean (float, optional): Mean "diameter", 30. is built-in value for "cyto" model; 17. is built-in value for "nuclei" model; if saved in custom model file (cellpose>=2.0) then it will be loaded automatically and overwrite this value.
             device (torch device, optional): Device used for model running / training (torch.device("cuda") or torch.device("cpu")), overrides gpu input, recommended if you want to use a specific GPU (e.g. torch.device("cuda:1")).
@@ -146,7 +147,7 @@ class CellposeModel():
             device_gpu = False
         self.gpu = device_gpu
 
-        if pretrained_model is None:
+        if pretrained_model is None and custom_weights is None:
             raise ValueError("Must specify a pretrained model, training from scratch is not implemented")
         
         ### create neural network
@@ -167,36 +168,37 @@ class CellposeModel():
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
         self.net = Transformer(dtype=dtype).to(self.device)
 
-        if os.path.exists(self.pretrained_model):
-            models_logger.info(f">>>> loading model {self.pretrained_model}")
-            self.net.load_model(self.pretrained_model, device=self.device)
-        else:
-            if os.path.split(self.pretrained_model)[-1] != 'cpsam':
-                raise FileNotFoundError('model file not recognized')
-            cache_CPSAM_model_path()
-            self.net.load_model(self.pretrained_model, device=self.device)
-        
-        # --- AUTOMATIC ARCHITECTURE INJECTION & FULL FINE-TUNING ---
-        if not manual:
-            models_logger.info("manual=False: Injecting SwitchableDualHeadDecoder (Backbone is fully trainable for fine-tuning).")
+        # --- ARCHITECTURE INJECTION (Must occur before custom_weights load) ---
+        if not manual or custom_weights is not None:
+            models_logger.info("Injecting SwitchableDualHeadDecoder...")
             
-            # 1. Unfreeze the entire ViT transformer and neck so it can learn domain features
-            for name, param in self.net.named_parameters():
-                # W2 is a mechanical PixelShuffle operation, keep it frozen
-                if name != 'W2': 
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
+            # Unfreeze the backbone if manual is False
+            if not manual:
+                for name, param in self.net.named_parameters():
+                    if name != 'W2': 
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
             
-            # 2. Inject the Dual-Head into the Cellpose model
             model_dtype = next(self.net.parameters()).dtype
             self.net.out = SwitchableDualHeadDecoder(
                 in_channels=256, 
-                out_channels=192 # Matches the standard 3 outputs needed by Cellpose (dY, dX, cellprob)
+                out_channels=192
             ).to(device=self.device, dtype=model_dtype)
-            
-            # Note: If running purely for inference, you would load your custom weights here:
-            # self.net.out.load_state_dict(torch.load("my_dual_head_weights.pth"))
+
+        # --- LOAD WEIGHTS ---
+        if custom_weights is not None and os.path.exists(custom_weights):
+            models_logger.info(f">>>> loading CUSTOM post-architectural weights {custom_weights}")
+            self.net.load_model(custom_weights, device=self.device)
+        else:
+            if os.path.exists(self.pretrained_model):
+                models_logger.info(f">>>> loading model {self.pretrained_model}")
+                self.net.load_model(self.pretrained_model, device=self.device)
+            else:
+                if os.path.split(self.pretrained_model)[-1] != 'cpsam':
+                    raise FileNotFoundError('model file not recognized')
+                cache_CPSAM_model_path()
+                self.net.load_model(self.pretrained_model, device=self.device)
         
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
@@ -206,7 +208,7 @@ class CellposeModel():
              min_size=15, max_size_fraction=0.4, niter=None, 
              augment=False, tile_overlap=0.1, bsize=256, 
              compute_masks=True, progress=None,
-             active_head='cells'):
+             active_head='cells', visualize=False, ground_truth=None):
         """ segment list of images x, or 4D array - Z x 3 x Y x X
 
         Args:
@@ -248,6 +250,8 @@ class CellposeModel():
             compute_masks (bool, optional): Whether or not to compute dynamics and return masks. Returns empty array if False. Defaults to True.
             progress (QProgressBar, optional): pyqt progress bar. Defaults to None.
             active_head (str, optional): Target decoder head ('cells', 'organelles', or 'both'). Defaults to 'cells'.
+            visualize (bool, optional): Plots raw image alongside predicted mask. Defaults to False.
+            ground_truth (np.ndarray, optional): Provide true mask to calculate IOu/F1 if visualize=True.
 
         Returns:
             A tuple containing (masks, flows, styles): 
@@ -293,7 +297,9 @@ class CellposeModel():
                     flow3D_smooth=flow3D_smooth,
                     progress=progress, 
                     niter=niter,
-                    active_head=active_head)
+                    active_head=active_head,
+                    visualize=visualize,
+                    ground_truth=[ground_truth[i]] if ground_truth is not None else None)
                 masks.append(maski)
                 flows.append(flowi)
                 styles.append(stylei)
@@ -301,6 +307,9 @@ class CellposeModel():
             return masks, flows, styles
 
         ############# actual eval code ############
+        # Capture raw image for visualization purposes before it gets tensorized
+        raw_x = np.copy(x)
+
         # reshape image
         x = transforms.convert_image(x, channel_axis=channel_axis,
                                         z_axis=z_axis, 
@@ -342,7 +351,7 @@ class CellposeModel():
             x = transforms.normalize_img(x, **normalize_params)
 
         # Set the active head on the decoder
-        if hasattr(self.net, 'out'):
+        if hasattr(self.net, 'out') and hasattr(self.net.out, 'active_head'):
             self.net.out.active_head = active_head
             
         network_outputs = self._run_net(
@@ -398,6 +407,63 @@ class CellposeModel():
             all_masks.append(masks)
             all_flows.append([plot.dx_to_circ(dP), dP, cellprob])
             all_styles.append(styles)
+
+        # --- VISUALIZATION AND EVALUATION OVERLAY ---
+        if visualize:
+            try:
+                import matplotlib.pyplot as plt
+                import matplotlib.patches as mpatches
+
+                head_to_plot = active_head if active_head != 'both' else 'cells'
+                mask_idx = 0 
+                
+                img_display = raw_x.squeeze()
+                if img_display.ndim > 2 and img_display.shape[0] in [1, 3, 4]:
+                    img_display = img_display.transpose(1, 2, 0)
+                if img_display.ndim > 2 and img_display.shape[-1] > 3:
+                    img_display = img_display[..., :3]
+
+                if img_display.max() > 1.0:
+                    img_display = (img_display - img_display.min()) / (img_display.max() - img_display.min())
+
+                pred_mask = all_masks[mask_idx]
+                
+                fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+                ax[0].imshow(img_display)
+                ax[0].set_title("Original Input")
+                ax[0].axis('off')
+                
+                ax[1].imshow(img_display)
+                if np.any(pred_mask > 0):
+                    ax[1].contour(pred_mask, levels=np.unique(pred_mask), colors='red', linewidths=0.5, alpha=0.8)
+                
+                title_text = f"Predicted Mask Overlay ({head_to_plot})"
+                
+                if ground_truth is not None:
+                    true_mask = ground_truth[0] if isinstance(ground_truth, list) else ground_truth
+                    true_mask = true_mask.squeeze()
+                    
+                    true_bin = true_mask > 0
+                    pred_bin = pred_mask > 0
+                    
+                    intersection = np.logical_and(true_bin, pred_bin).sum()
+                    union = np.logical_or(true_bin, pred_bin).sum()
+                    iou = intersection / union if union > 0 else 0.0
+                    
+                    precision = intersection / pred_bin.sum() if pred_bin.sum() > 0 else 0.0
+                    recall = intersection / true_bin.sum() if true_bin.sum() > 0 else 0.0
+                    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+                    
+                    legend_patch = mpatches.Patch(color='red', label=f'Pixel F1: {f1:.4f} | IoU: {iou:.4f}')
+                    ax[1].legend(handles=[legend_patch], loc='lower right', framealpha=0.9)
+
+                ax[1].set_title(title_text)
+                ax[1].axis('off')
+                plt.tight_layout()
+                plt.show()
+                
+            except Exception as e:
+                models_logger.warning(f"Visualization failed: {e}")
 
         if active_head == 'both':
             return np.stack(all_masks, axis=0), all_flows, all_styles
