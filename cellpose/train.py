@@ -364,8 +364,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                                     weight_decay=weight_decay)
 
     # DYNAMICALLY SET MULTI-HEAD MODE BEFORE LOOP
-    if hasattr(net, 'active_head'):
-        net.active_head = 'both' if organelles else 'cells'
+    if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
+        net.out.active_head = 'both' if organelles else 'cells'
 
     t0 = time.time()
     model_name = f"cellpose_{t0}" if model_name is None else model_name
@@ -392,8 +392,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             param_group["lr"] = LR[iepoch] # set learning rate
             
         net.train()
-        if hasattr(net, 'active_head'):
-            net.active_head = 'both' if organelles else 'cells'
+        if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
+            net.out.active_head = 'both' if organelles else 'cells'
 
         for k in range(0, nimg_per_epoch, batch_size):
             kend = min(k + batch_size, nimg_per_epoch)
@@ -481,8 +481,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 for ibatch in range(0, len(rperm), batch_size):
                     with torch.no_grad():
                         net.eval()
-                        if hasattr(net, 'active_head'):
-                            net.active_head = 'both' if organelles else 'cells'
+                        if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
+                            net.out.active_head = 'both' if organelles else 'cells'
                             
                         inds = rperm[ibatch:ibatch + batch_size]
                         
