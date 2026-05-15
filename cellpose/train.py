@@ -200,18 +200,18 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
     ### check that flows are computed
     if train_labels is not None:
         train_labels = dynamics.labels_to_flows(train_labels, files=train_files,
-                                                device=device, use_gpu=True)
+                                                device=device)
         if test_labels is not None:
             test_labels = dynamics.labels_to_flows(test_labels, files=test_files,
-                                                   device=device, use_gpu=True)
+                                                   device=device)
     elif compute_flows:
         for k in trange(nimg):
             tl = dynamics.labels_to_flows(io.imread(train_labels_files),
-                                          files=train_files, device=device, use_gpu=True)
+                                          files=train_files, device=device)
         if test_files is not None:
             for k in trange(nimg_test):
                 tl = dynamics.labels_to_flows(io.imread(test_labels_files),
-                                              files=test_files, device=device, use_gpu=True)
+                                              files=test_files, device=device)
 
     ### compute diameters
     nmasks = np.zeros(nimg)
@@ -537,7 +537,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 lavgt /= len(rperm)
                 test_losses[iepoch] = lavgt
                 
-        # 3. PRINT INDENTATION FIX (Un-indented so it prints every epoch)
+        # Calculate and log per-epoch stats (UN-INDENTED to print every epoch)
         lavg /= nsum
         train_logger.info(
             f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
