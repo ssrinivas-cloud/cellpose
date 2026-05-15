@@ -176,13 +176,14 @@ class CellposeModel():
             cache_CPSAM_model_path()
             self.net.load_model(self.pretrained_model, device=self.device)
         
-        # --- AUTOMATIC ARCHITECTURE INJECTION & FREEZING ---
+        # --- AUTOMATIC ARCHITECTURE INJECTION & FULL FINE-TUNING ---
         if not manual:
-            models_logger.info("manual=False: Freezing backbone and injecting SwitchableDualHeadDecoder.")
+            models_logger.info("manual=False: Injecting SwitchableDualHeadDecoder (Backbone is fully trainable for fine-tuning).")
             
-            # 1. Freeze the massive ViT transformer, keep neck and out trainable
+            # 1. Unfreeze the entire ViT transformer and neck so it can learn domain features
             for name, param in self.net.named_parameters():
-                if 'neck' in name or 'out' in name:
+                # W2 is a mechanical PixelShuffle operation, keep it frozen
+                if name != 'W2': 
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
