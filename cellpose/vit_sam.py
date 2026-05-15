@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 class Transformer(nn.Module):
     def __init__(self, backbone="vit_l", ps=8, nout=3, bsize=256, rdrop=0.4,
-                  checkpoint=None, dtype=torch.float32):
+                 checkpoint=None, dtype=torch.float32):
         super(Transformer, self).__init__()
 
         # instantiate the vit model, default to not loading SAM
@@ -75,10 +75,18 @@ class Transformer(nn.Module):
 
         # readout is changed here
         x1 = self.out(x)
-        x1 = F.conv_transpose2d(x1, self.W2, stride = self.ps, padding = 0)
         
+        # --- MULTI-HEAD FIX ---
+        if isinstance(x1, tuple):
+            # If it's a tuple, apply the final upsampling to both heads
+            y_cell = F.conv_transpose2d(x1[0], self.W2, stride=self.ps, padding=0)
+            y_org = F.conv_transpose2d(x1[1], self.W2, stride=self.ps, padding=0)
+            x1 = (y_cell, y_org)
+        else:
+            # Standard single-head upsampling
+            x1 = F.conv_transpose2d(x1, self.W2, stride=self.ps, padding=0)
+
         # maintain the second output of feature size 256 for backwards compatibility
-           
         return x1, torch.zeros((x.shape[0], 256), device=x.device)
     
     def load_model(self, PATH, device, strict = False):
@@ -204,7 +212,3 @@ class CPnetBioImageIO(Transformer):
             super().load_state_dict(
                 {name: param for name, param in state_dict.items()},
                 strict=False)
-
-
-    
-
