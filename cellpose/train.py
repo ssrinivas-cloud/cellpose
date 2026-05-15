@@ -291,7 +291,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None,
-              organelles=True, hf_repo_id=None, hf_token=None):
+              organelles=True, hf_repo_id=None, hf_token=None, save_flows=False):
     
     if SGD:
         train_logger.warning("SGD is deprecated, using AdamW instead")
@@ -326,6 +326,34 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
      test_data, test_labels, test_files, test_labels_files, test_probs, diam_test,
      normed) = out
      
+    # --- NEW: SAVE AND UPLOAD COMPUTED FLOWS ---
+    if save_flows:
+        save_path_obj = Path.cwd() if save_path is None else Path(save_path)
+        flows_dir = save_path_obj / "computed_flows"
+        flows_dir.mkdir(parents=True, exist_ok=True)
+        
+        train_logger.info(f">>> Saving computed flows locally to {flows_dir}")
+        if train_labels is not None:
+            for i, flow in enumerate(train_labels):
+                np.save(flows_dir / f"train_flow_{i}.npy", flow)
+        if test_labels is not None:
+            for i, flow in enumerate(test_labels):
+                np.save(flows_dir / f"test_flow_{i}.npy", flow)
+                
+        if hf_repo_id and hf_token:
+            train_logger.info(f">>> Uploading flows to Hugging Face Hub: {hf_repo_id}")
+            try:
+                api = HfApi(token=hf_token)
+                api.upload_folder(
+                    folder_path=str(flows_dir),
+                    path_in_repo="computed_flows",
+                    repo_id=hf_repo_id,
+                    repo_type="model"
+                )
+                train_logger.info(">>> Flows upload successful!")
+            except Exception as e:
+                train_logger.error(f">>> Failed to upload flows to Hugging Face: {e}")
+
     # already normalized, do not normalize during training
     if normed:
         kwargs = {}
