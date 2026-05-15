@@ -200,18 +200,18 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
     ### check that flows are computed
     if train_labels is not None:
         train_labels = dynamics.labels_to_flows(train_labels, files=train_files,
-                                                device=device)
+                                                device=device, use_gpu=True)
         if test_labels is not None:
             test_labels = dynamics.labels_to_flows(test_labels, files=test_files,
-                                                   device=device)
+                                                   device=device, use_gpu=True)
     elif compute_flows:
         for k in trange(nimg):
             tl = dynamics.labels_to_flows(io.imread(train_labels_files),
-                                          files=train_files, device=device)
+                                          files=train_files, device=device, use_gpu=True)
         if test_files is not None:
             for k in trange(nimg_test):
                 tl = dynamics.labels_to_flows(io.imread(test_labels_files),
-                                              files=test_files, device=device)
+                                              files=test_files, device=device, use_gpu=True)
 
     ### compute diameters
     nmasks = np.zeros(nimg)
@@ -291,7 +291,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None,
-              hf_repo_id=None, hf_token=None):
+              organelles=True, hf_repo_id=None, hf_token=None):
     
     if SGD:
         train_logger.warning("SGD is deprecated, using AdamW instead")
@@ -363,6 +363,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate,
                                     weight_decay=weight_decay)
 
+    # DYNAMICALLY SET MULTI-HEAD MODE BEFORE LOOP
+    if hasattr(net, 'active_head'):
+        net.active_head = 'both' if organelles else 'cells'
+
     t0 = time.time()
     model_name = f"cellpose_{t0}" if model_name is None else model_name
     save_path = Path.cwd() if save_path is None else Path(save_path)
@@ -388,6 +392,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             param_group["lr"] = LR[iepoch] # set learning rate
             
         net.train()
+        if hasattr(net, 'active_head'):
+            net.active_head = 'both' if organelles else 'cells'
+
         for k in range(0, nimg_per_epoch, batch_size):
             kend = min(k + batch_size, nimg_per_epoch)
             inds = rperm[k:kend]
@@ -409,30 +416,42 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             X = torch.from_numpy(imgi).to(device)
             lbl = torch.from_numpy(lbl).to(device)
             
-            # Convert tasks to tensor for boolean masking
-            batch_tasks_tensor = torch.tensor(batch_tasks, device=device)
-            cell_mask = (batch_tasks_tensor == 0)
-            org_mask = (batch_tasks_tensor == 1)
+            loss = torch.tensor(0.0, device=device)
 
             with torch.autocast(device_type=device.type, dtype=net.dtype):
-                # Unpack the two heads from the network
-                y_cell, y_org = net(X)
+                # 1. PROPERLY UNPACK OUTPUTS AND STYLE
+                outputs, style = net(X)
                 
-            loss = torch.tensor(0.0, device=device)
-            
-            # Route cell loss
-            if cell_mask.any():
-                loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
-                if y_cell.shape[1] > 3:
-                    loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
-                loss += loss_cell
-                
-            # Route organelle loss
-            if org_mask.any():
-                loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
-                if y_org.shape[1] > 3:
-                    loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
-                loss += loss_org
+                # 2. BRANCH BASED ON `organelles` FLAG
+                if organelles:
+                    y_cell, y_org = outputs
+                    
+                    # Convert tasks to tensor for boolean masking
+                    batch_tasks_tensor = torch.tensor(batch_tasks, device=device)
+                    cell_mask = (batch_tasks_tensor == 0)
+                    org_mask = (batch_tasks_tensor == 1)
+
+                    # Route cell loss
+                    if cell_mask.any():
+                        loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
+                        if y_cell.shape[1] > 3:
+                            loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
+                        loss += loss_cell
+                        
+                    # Route organelle loss
+                    if org_mask.any():
+                        loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
+                        if y_org.shape[1] > 3:
+                            loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
+                        loss += loss_org
+                        
+                else:
+                    # STANDARD SINGLE-HEAD LOGIC
+                    y_cell = outputs
+                    loss_cell = _loss_fn_seg(lbl, y_cell, device)
+                    if y_cell.shape[1] > 3:
+                        loss_cell += _loss_fn_class(lbl, y_cell, class_weights=class_weights)
+                    loss += loss_cell
 
             optimizer.zero_grad()
             loss.backward()
@@ -462,6 +481,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 for ibatch in range(0, len(rperm), batch_size):
                     with torch.no_grad():
                         net.eval()
+                        if hasattr(net, 'active_head'):
+                            net.active_head = 'both' if organelles else 'cells'
+                            
                         inds = rperm[ibatch:ibatch + batch_size]
                         
                         imgs, lbls, batch_tasks = _get_batch(inds, data=test_data,
@@ -478,26 +500,35 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         X = torch.from_numpy(imgi).to(device)
                         lbl = torch.from_numpy(lbl).to(device)
                         
-                        batch_tasks_tensor = torch.tensor(batch_tasks, device=device)
-                        cell_mask = (batch_tasks_tensor == 0)
-                        org_mask = (batch_tasks_tensor == 1)
+                        loss = torch.tensor(0.0, device=device)
 
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
-                            y_cell, y_org = net(X)
+                            outputs, style = net(X)
                             
-                        loss = torch.tensor(0.0, device=device)
-                        
-                        if cell_mask.any():
-                            loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
-                            if y_cell.shape[1] > 3:
-                                loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
-                            loss += loss_cell
-                            
-                        if org_mask.any():
-                            loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
-                            if y_org.shape[1] > 3:
-                                loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
-                            loss += loss_org
+                            if organelles:
+                                y_cell, y_org = outputs
+                                
+                                batch_tasks_tensor = torch.tensor(batch_tasks, device=device)
+                                cell_mask = (batch_tasks_tensor == 0)
+                                org_mask = (batch_tasks_tensor == 1)
+
+                                if cell_mask.any():
+                                    loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
+                                    if y_cell.shape[1] > 3:
+                                        loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
+                                    loss += loss_cell
+                                    
+                                if org_mask.any():
+                                    loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
+                                    if y_org.shape[1] > 3:
+                                        loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
+                                    loss += loss_org
+                            else:
+                                y_cell = outputs
+                                loss_cell = _loss_fn_seg(lbl, y_cell, device)
+                                if y_cell.shape[1] > 3:
+                                    loss_cell += _loss_fn_class(lbl, y_cell, class_weights=class_weights)
+                                loss += loss_cell
                         
                         test_loss = loss.item()
                         test_loss *= len(imgi)
@@ -506,11 +537,12 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 lavgt /= len(rperm)
                 test_losses[iepoch] = lavgt
                 
-            lavg /= nsum
-            train_logger.info(
-                f"{iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
-            )
-            lavg, nsum = 0, 0
+        # 3. PRINT INDENTATION FIX (Un-indented so it prints every epoch)
+        lavg /= nsum
+        train_logger.info(
+            f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
+        )
+        lavg, nsum = 0, 0
 
         if iepoch == n_epochs - 1 or (iepoch % save_every == 0 and iepoch != 0):
             if save_each and iepoch != n_epochs - 1:  #separate files as model progresses
