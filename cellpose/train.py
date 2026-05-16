@@ -291,7 +291,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None,
-              organelles=True, hf_repo_id=None, hf_token=None, save_flows=False):
+              organelles=True, hf_repo_id=None, hf_token=None, save_flows=False, load_flows_dir=None):
     
     if SGD:
         train_logger.warning("SGD is deprecated, using AdamW instead")
@@ -313,6 +313,19 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         normalize_params = models.normalize_default
         normalize_params["normalize"] = normalize
 
+    # --- NEW: LOAD PRECOMPUTED FLOWS TO SKIP 1.5 HOUR WAIT ---
+    if load_flows_dir is not None and os.path.exists(load_flows_dir):
+        flows_dir = Path(load_flows_dir)
+        train_logger.info(f">>> Loading precomputed flows from {flows_dir} to skip computation...")
+        try:
+            if train_data is not None:
+                train_labels = [np.load(flows_dir / f"train_flow_{i}.npy") for i in range(len(train_data))]
+            if test_data is not None:
+                test_labels = [np.load(flows_dir / f"test_flow_{i}.npy") for i in range(len(test_data))]
+            train_logger.info(">>> Successfully loaded precomputed flows!")
+        except Exception as e:
+            train_logger.error(f">>> Failed to load precomputed flows: {e}")
+
     out = _process_train_test(train_data=train_data, train_labels=train_labels,
                               train_files=train_files, train_labels_files=train_labels_files,
                               train_probs=train_probs,
@@ -327,7 +340,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
      normed) = out
      
     # --- NEW: SAVE AND UPLOAD COMPUTED FLOWS ---
-    if save_flows:
+    # Only save if we didn't just load them from disk
+    if save_flows and load_flows_dir is None:
         save_path_obj = Path.cwd() if save_path is None else Path(save_path)
         flows_dir = save_path_obj / "computed_flows"
         flows_dir.mkdir(parents=True, exist_ok=True)
