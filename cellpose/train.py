@@ -313,7 +313,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         normalize_params = models.normalize_default
         normalize_params["normalize"] = normalize
 
-    # --- NEW: LOAD PRECOMPUTED FLOWS TO SKIP 1.5 HOUR WAIT ---
+    # --- LOAD PRECOMPUTED FLOWS ---
     if load_flows_dir is not None and os.path.exists(load_flows_dir):
         flows_dir = Path(load_flows_dir)
         train_logger.info(f">>> Loading precomputed flows from {flows_dir} to skip computation...")
@@ -339,8 +339,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
      test_data, test_labels, test_files, test_labels_files, test_probs, diam_test,
      normed) = out
      
-    # --- NEW: SAVE AND UPLOAD COMPUTED FLOWS ---
-    # Only save if we didn't just load them from disk
+    # --- SAVE AND UPLOAD COMPUTED FLOWS ---
     if save_flows and load_flows_dir is None:
         save_path_obj = Path.cwd() if save_path is None else Path(save_path)
         flows_dir = save_path_obj / "computed_flows"
@@ -461,10 +460,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             loss = torch.tensor(0.0, device=device)
 
             with torch.autocast(device_type=device.type, dtype=net.dtype):
-                # 1. PROPERLY UNPACK OUTPUTS AND STYLE
+                # PROPERLY UNPACK OUTPUTS AND STYLE
                 outputs, style = net(X)
                 
-                # 2. BRANCH BASED ON `organelles` FLAG
+                # BRANCH BASED ON `organelles` FLAG
                 if organelles:
                     y_cell, y_org = outputs
                     
@@ -585,133 +584,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
         )
         lavg, nsum = 0, 0
-
-        # --- VISUALIZATION DURING TRAINING ---
-        if visualize and (iepoch % 10 == 0 or iepoch == n_epochs - 1) and test_data is not None and len(test_data) > 0:
-            try:
-                import matplotlib.pyplot as plt
-                import matplotlib.patches as mpatches
-
-                train_logger.info(f">>> Generating visual report for Epoch {iepoch}...")
-
-                # 1. Identify which images to plot (First Cell image and First Organelle image)
-                cell_idx = next((i for i, t in enumerate(test_tasks) if t == 0), None)
-                org_idx = next((i for i, t in enumerate(test_tasks) if t == 1), None)
-
-                indices_to_plot = []
-                if cell_idx is not None:
-                    indices_to_plot.append(('Cells', cell_idx))
-                if organelles and org_idx is not None:
-                    indices_to_plot.append(('Organelles', org_idx))
-
-                if indices_to_plot:
-                    n_rows = len(indices_to_plot)
-                    fig, axes = plt.subplots(n_rows, 2, figsize=(14, 7 * n_rows))
-                    
-                    # Force axes into a 2D array structure even if there's only 1 row
-                    if n_rows == 1:
-                        axes = [axes] 
-
-                    net.eval()
-                    if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
-                        net.out.active_head = 'both' if organelles else 'cells'
-
-                    for row, (task_name, idx) in enumerate(indices_to_plot):
-                        img = test_data[idx]
-                        
-                        # The true mask is at index 0 of test_labels BEFORE the batch generator strips it
-                        true_mask = test_labels[idx][0]
-                        true_count = len(np.unique(true_mask)) - 1 if len(np.unique(true_mask)) > 0 else 0
-
-                        # Prepare Input Tensor (Normalize it exactly as training loop does)
-                        X_input, _, _ = _get_batch([idx], data=test_data, labels=test_labels, tasks=test_tasks, **kwargs)
-                        
-                        X_raw = X_input[0] # Shape: [C, H, W]
-                        C_dim, H_dim, W_dim = X_raw.shape
-
-                        # 1. Pad spatial dimensions to the nearest multiple of 32 for U-Net skip connections
-                        pad_H = (32 - (H_dim % 32)) % 32
-                        pad_W = (32 - (W_dim % 32)) % 32
-                        
-                        if pad_H > 0 or pad_W > 0:
-                            X_padded = np.pad(X_raw, ((0, 0), (0, pad_H), (0, pad_W)), mode='reflect')
-                        else:
-                            X_padded = X_raw
-
-                        X_tensor = torch.from_numpy(X_padded).unsqueeze(0).to(device)
-
-                        # Forward Pass
-                        with torch.no_grad():
-                            with torch.autocast(device_type=device.type, dtype=net.dtype):
-                                outputs, _ = net(X_tensor)
-                                if organelles:
-                                    # Grab index 0 for Cells, index 1 for Organelles
-                                    y_out = outputs[0] if task_name == 'Cells' else outputs[1]
-                                else:
-                                    y_out = outputs
-
-                        # Extract the spatial flows and cellprob from the model output
-                        y_out = y_out.squeeze().cpu().numpy()
-                        
-                        # 2. Crop the output back to the original image dimensions
-                        y_out = y_out[:, :H_dim, :W_dim]
-                        
-                        dP = y_out[-3:-1]      # The Y and X flow gradients
-                        cellprob = y_out[-1]   # The probability map
-
-                        # Push through Cellpose dynamics engine to reconstruct physical masks
-                        pred_mask = dynamics.compute_masks(dP, cellprob, niter=200, cellprob_threshold=0.0, flow_threshold=0.4)[0]
-                        pred_count = len(np.unique(pred_mask)) - 1 if len(np.unique(pred_mask)) > 0 else 0
-
-                        # Calculate Validation Metrics (IoU & F1) at 0.0 threshold
-                        true_bin = true_mask > 0
-                        pred_bin = pred_mask > 0
-                        
-                        intersection = np.logical_and(true_bin, pred_bin).sum()
-                        union = np.logical_or(true_bin, pred_bin).sum()
-                        iou = intersection / union if union > 0 else 0.0
-
-                        precision = intersection / pred_bin.sum() if pred_bin.sum() > 0 else 0.0
-                        recall = intersection / true_bin.sum() if true_bin.sum() > 0 else 0.0
-                        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-
-                        # Prepare image for matplotlib display
-                        img_disp = img.transpose(1, 2, 0) if img.shape[0] == 3 else img
-                        if img_disp.max() > 1.0:
-                            img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
-
-                        # --- PLOT LEFT: ACTUAL (GROUND TRUTH) ---
-                        ax_gt = axes[row][0]
-                        ax_gt.imshow(img_disp)
-                        if np.any(true_mask > 0):
-                            ax_gt.contour(true_mask, levels=np.unique(true_mask), colors='lime', linewidths=1.0, alpha=0.9)
-                        ax_gt.set_title(f"Epoch {iepoch} | {task_name} - Actual GT (Count: {true_count})", fontsize=14, fontweight='bold')
-                        ax_gt.axis('off')
-
-                        # --- PLOT RIGHT: PREDICTED ---
-                        ax_pred = axes[row][1]
-                        ax_pred.imshow(img_disp)
-                        if np.any(pred_mask > 0):
-                            ax_pred.contour(pred_mask, levels=np.unique(pred_mask), colors='red', linewidths=1.0, alpha=0.9)
-                        ax_pred.set_title(f"Epoch {iepoch} | {task_name} - Predicted (Count: {pred_count})", fontsize=14, fontweight='bold')
-                        ax_pred.axis('off')
-
-                        # Add Metrics Legend to Prediction Box
-                        legend_patch = mpatches.Patch(color='red', label=f'Pixel F1: {f1:.4f} | IoU: {iou:.4f}')
-                        ax_pred.legend(handles=[legend_patch], loc='lower right', framealpha=0.9, fontsize=12)
-
-                    plt.tight_layout()
-                    
-                    # --- NEW: SAVE TO DISK INSTEAD OF BLOCKING WITH plt.show() ---
-                    vis_save_path = save_path / "visualizations"
-                    vis_save_path.mkdir(exist_ok=True)
-                    vis_file = vis_save_path / f"epoch_{iepoch:04d}_vis.png"
-                    plt.savefig(vis_file, bbox_inches='tight')
-                    plt.close(fig)
-                    train_logger.info(f">>> Visual report saved to {vis_file}")
-
-            except Exception as e:
-                train_logger.warning(f"Failed to generate visualization: {e}")
 
         if iepoch == n_epochs - 1 or (iepoch % save_every == 0 and iepoch != 0):
             if save_each and iepoch != n_epochs - 1:  #separate files as model progresses
