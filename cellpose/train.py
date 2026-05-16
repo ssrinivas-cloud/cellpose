@@ -579,7 +579,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 lavgt /= len(rperm)
                 test_losses[iepoch] = lavgt
                 
-        # Calculate and log per-epoch stats (UN-INDENTED to print every epoch)
+        # Calculate and log per-epoch stats
         lavg /= nsum
         train_logger.info(
             f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
@@ -625,7 +625,20 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
                         # Prepare Input Tensor (Normalize it exactly as training loop does)
                         X_input, _, _ = _get_batch([idx], data=test_data, labels=test_labels, tasks=test_tasks, **kwargs)
-                        X_tensor = torch.from_numpy(X_input[0]).unsqueeze(0).to(device)
+                        
+                        X_raw = X_input[0] # Shape: [C, H, W]
+                        C_dim, H_dim, W_dim = X_raw.shape
+
+                        # 1. Pad spatial dimensions to the nearest multiple of 32 for U-Net skip connections
+                        pad_H = (32 - (H_dim % 32)) % 32
+                        pad_W = (32 - (W_dim % 32)) % 32
+                        
+                        if pad_H > 0 or pad_W > 0:
+                            X_padded = np.pad(X_raw, ((0, 0), (0, pad_H), (0, pad_W)), mode='reflect')
+                        else:
+                            X_padded = X_raw
+
+                        X_tensor = torch.from_numpy(X_padded).unsqueeze(0).to(device)
 
                         # Forward Pass
                         with torch.no_grad():
@@ -639,6 +652,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
                         # Extract the spatial flows and cellprob from the model output
                         y_out = y_out.squeeze().cpu().numpy()
+                        
+                        # 2. Crop the output back to the original image dimensions
+                        y_out = y_out[:, :H_dim, :W_dim]
+                        
                         dP = y_out[-3:-1]      # The Y and X flow gradients
                         cellprob = y_out[-1]   # The probability map
 
@@ -684,7 +701,14 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         ax_pred.legend(handles=[legend_patch], loc='lower right', framealpha=0.9, fontsize=12)
 
                     plt.tight_layout()
-                    plt.show()
+                    
+                    # --- NEW: SAVE TO DISK INSTEAD OF BLOCKING WITH plt.show() ---
+                    vis_save_path = save_path / "visualizations"
+                    vis_save_path.mkdir(exist_ok=True)
+                    vis_file = vis_save_path / f"epoch_{iepoch:04d}_vis.png"
+                    plt.savefig(vis_file, bbox_inches='tight')
+                    plt.close(fig)
+                    train_logger.info(f">>> Visual report saved to {vis_file}")
 
             except Exception as e:
                 train_logger.warning(f"Failed to generate visualization: {e}")
