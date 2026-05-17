@@ -82,8 +82,11 @@ class SwitchableDualHeadDecoder(nn.Module):
             return self.cell_head(x)
         elif self.active_head == 'organelles':
             return self.organelle_head(x)
+        elif self.active_head == 'eval_both':
+            # MAGIC BYPASS: Concatenate along channels to survive core.run_net's rigid tiling
+            return torch.cat([self.cell_head(x), self.organelle_head(x)], dim=1)
         else:
-            # If set to 'both', return the tuple (useful later for your custom training loop)
+            # If set to 'both', return the tuple (used by your train.py loop)
             return self.cell_head(x), self.organelle_head(x)
 
 
@@ -352,7 +355,8 @@ class CellposeModel():
 
         # Set the active head on the decoder
         if hasattr(self.net, 'out') and hasattr(self.net.out, 'active_head'):
-            self.net.out.active_head = active_head
+            # Convert 'both' to 'eval_both' so core.py doesn't crash on the tuple
+            self.net.out.active_head = 'eval_both' if active_head == 'both' else active_head
             
         network_outputs = self._run_net(
             x,
@@ -364,7 +368,7 @@ class CellposeModel():
             bsize=bsize,
             do_3D=do_3D, 
             anisotropy=anisotropy,
-            active_head=active_head)
+            active_head=active_head) # Pass the original 'both' flag so _run_net knows to split it
 
         all_masks = []
         all_flows = []
