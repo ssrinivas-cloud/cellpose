@@ -612,7 +612,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         lavg, nsum = 0, 0
 
         # --- EVALUATION AND VISUALIZATION EVERY 10 EPOCHS ---
-        if iepoch % 5 == 0 and iepoch > 0 and test_data is not None and organelles:
+        if iepoch % 10 == 0 and iepoch > 0 and test_data is not None and organelles:
             train_logger.info(f">>> Running requested full evaluation pipeline for Epoch {iepoch}...")
             
             # 1. Save weights explicitly for the eval block to load
@@ -633,9 +633,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 active_head='both'         # <--- The magic switch
             )
             
-            # masks_both is stacked: [0] = Cells, [1] = Organelles
-            pred_cells = masks_both[0]
-            pred_orgs = masks_both[1]
+            # masks_both contains a pair of masks [Cell_Mask, Org_Mask] for EACH image
+            # We unpack them into two separate lists across all images
+            pred_cells = [m[0] for m in masks_both]
+            pred_orgs = [m[1] for m in masks_both]
             
             # 4. Helper Function for Pixel-Wise Metrics
             def calculate_metrics(gt_masks, pred_masks):
