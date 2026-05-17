@@ -404,10 +404,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     
     optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    # --- NEW: Initialize GradScaler for mixed precision stability ---
+    # Initialize GradScaler for mixed precision stability
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
 
-    # --- NEW: Set Accumulation Steps (Simulates a larger batch size) ---
+    # Set Accumulation Steps (Simulates a larger batch size)
     accumulation_steps = 8
 
     # DYNAMICALLY SET MULTI-HEAD MODE BEFORE LOOP
@@ -442,7 +442,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
             net.out.active_head = 'both' if organelles else 'cells'
 
-        # --- NEW: Zero gradients BEFORE the inner loop begins ---
+        # Zero gradients BEFORE the inner loop begins
         optimizer.zero_grad()
 
         for k in range(0, nimg_per_epoch, batch_size):
@@ -503,13 +503,13 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         loss_cell += _loss_fn_class(lbl, y_cell, class_weights=class_weights)
                     loss += loss_cell
 
-            # --- NEW: Scale loss for gradient accumulation ---
+            # Scale loss for gradient accumulation
             loss = loss / accumulation_steps
 
-            # --- NEW: Use Scaler for backward pass ---
+            # Use Scaler for backward pass
             scaler.scale(loss).backward()
             
-            # --- NEW: Optimizer Step with Accumulation and Gradient Clipping ---
+            # Optimizer Step with Accumulation and Gradient Clipping
             if (k // batch_size + 1) % accumulation_steps == 0 or (k + batch_size) >= nimg_per_epoch:
                 # Unscale gradients before clipping
                 scaler.unscale_(optimizer)
@@ -610,6 +610,146 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
         )
         lavg, nsum = 0, 0
+
+        # --- EVALUATION AND VISUALIZATION EVERY 10 EPOCHS ---
+        if iepoch % 10 == 0 and iepoch > 0 and test_data is not None and organelles:
+            train_logger.info(f">>> Running requested full evaluation pipeline for Epoch {iepoch}...")
+            
+            # 1. Save weights explicitly for the eval block to load
+            temp_model_path = str(filename) + f"_eval_temp_epoch_{iepoch:04d}"
+            net.save_model(temp_model_path)
+            
+            # 2. Load the model using custom_weights to inject the dual-head architecture
+            eval_model = models.CellposeModel(gpu=True, custom_weights=temp_model_path)
+            
+            # 3. Run inference with active_head='both'
+            train_logger.info(f">>> Running dual-head inference on {len(test_data)} test images...")
+            masks_both, flows_both, styles_both, diams_both = eval_model.eval(
+                test_data, 
+                batch_size=2, 
+                channels=[0,0], 
+                cellprob_threshold=0.0, 
+                rescale=1.0,               # Change this if you used a specific rescale factor
+                active_head='both'         # <--- The magic switch
+            )
+            
+            # masks_both is stacked: [0] = Cells, [1] = Organelles
+            pred_cells = masks_both[0]
+            pred_orgs = masks_both[1]
+            
+            # 4. Helper Function for Pixel-Wise Metrics
+            def calculate_metrics(gt_masks, pred_masks):
+                tp = fp = fn = 0
+                for gt, pred in zip(gt_masks, pred_masks):
+                    # Binarize masks for Pixel-wise logic
+                    gt_bin = gt > 0
+                    pred_bin = pred > 0
+                    
+                    tp += np.logical_and(gt_bin, pred_bin).sum()
+                    fp += np.logical_and(~gt_bin, pred_bin).sum()  # gt == 0 and pred > 0
+                    fn += np.logical_and(gt_bin, ~pred_bin).sum()  # gt > 0 and pred == 0
+
+                iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
+                f1 = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+                return iou, f1
+            
+            # Extract dynamically using test_tasks (0 = Cells, 1 = Organelles)
+            cell_indices = [i for i, t in enumerate(test_tasks) if t == 0]
+            org_indices = [i for i, t in enumerate(test_tasks) if t == 1]
+            
+            # Slice out the cell ground truths and predictions
+            gt_cells_only = [test_labels[i][0] for i in cell_indices] # Extract spatial mask
+            pred_cells_only = [pred_cells[i] for i in cell_indices]
+
+            # Slice out the organelle ground truths and predictions
+            gt_orgs_only = [test_labels[i][0] for i in org_indices]   # Extract spatial mask
+            pred_orgs_only = [pred_orgs[i] for i in org_indices]
+            
+            # Compute
+            iou_cells, f1_cells = calculate_metrics(gt_cells_only, pred_cells_only)
+            iou_orgs, f1_orgs = calculate_metrics(gt_orgs_only, pred_orgs_only)
+
+            train_logger.info("\n--- FINAL EVALUATION SCORES ---")
+            train_logger.info(f"CELLS      | IOU: {iou_cells:.4f} | F1: {f1_cells:.4f}")
+            train_logger.info(f"ORGANELLES | IOU: {iou_orgs:.4f} | F1: {f1_orgs:.4f}")
+
+            # 5. Visualization Block (2x2 Grid)
+            if visualize:
+                try:
+                    import matplotlib.pyplot as plt
+                    import matplotlib.patches as mpatches
+                    
+                    fig, axes = plt.subplots(2, 2, figsize=(14, 14))
+                    
+                    # Plot Row 0: Cells
+                    if len(cell_indices) > 0:
+                        c_idx = cell_indices[0] # Grab first available cell image
+                        img_c = test_data[c_idx]
+                        
+                        # Format image array for matplotlib
+                        img_disp_c = img_c.transpose(1, 2, 0) if img_c.shape[0] == 3 else img_c
+                        if img_disp_c.max() > 1.0:
+                            img_disp_c = (img_disp_c - img_disp_c.min()) / (img_disp_c.max() - img_disp_c.min())
+                            
+                        gt_mask_c = gt_cells_only[0]
+                        pred_mask_c = pred_cells_only[0]
+                        
+                        # Top-Left: Cell GT
+                        axes[0, 0].imshow(img_disp_c)
+                        if np.any(gt_mask_c > 0):
+                            axes[0, 0].contour(gt_mask_c, levels=np.unique(gt_mask_c), colors='lime', linewidths=1.0)
+                        axes[0, 0].set_title(f"Epoch {iepoch} | Cells - Actual GT", fontsize=14, fontweight='bold')
+                        axes[0, 0].axis('off')
+                        
+                        # Top-Right: Cell Prediction
+                        axes[0, 1].imshow(img_disp_c)
+                        if np.any(pred_mask_c > 0):
+                            axes[0, 1].contour(pred_mask_c, levels=np.unique(pred_mask_c), colors='red', linewidths=1.0)
+                        axes[0, 1].set_title(f"Epoch {iepoch} | Cells - Predicted", fontsize=14, fontweight='bold')
+                        axes[0, 1].axis('off')
+                        
+                    # Plot Row 1: Organelles
+                    if len(org_indices) > 0:
+                        o_idx = org_indices[0] # Grab first available organelle image
+                        img_o = test_data[o_idx]
+                        
+                        # Format image array for matplotlib
+                        img_disp_o = img_o.transpose(1, 2, 0) if img_o.shape[0] == 3 else img_o
+                        if img_disp_o.max() > 1.0:
+                            img_disp_o = (img_disp_o - img_disp_o.min()) / (img_disp_o.max() - img_disp_o.min())
+                            
+                        gt_mask_o = gt_orgs_only[0]
+                        pred_mask_o = pred_orgs_only[0]
+                        
+                        # Bottom-Left: Organelle GT
+                        axes[1, 0].imshow(img_disp_o)
+                        if np.any(gt_mask_o > 0):
+                            axes[1, 0].contour(gt_mask_o, levels=np.unique(gt_mask_o), colors='lime', linewidths=1.0)
+                        axes[1, 0].set_title(f"Epoch {iepoch} | Organelles - Actual GT", fontsize=14, fontweight='bold')
+                        axes[1, 0].axis('off')
+                        
+                        # Bottom-Right: Organelle Prediction
+                        axes[1, 1].imshow(img_disp_o)
+                        if np.any(pred_mask_o > 0):
+                            axes[1, 1].contour(pred_mask_o, levels=np.unique(pred_mask_o), colors='red', linewidths=1.0)
+                        axes[1, 1].set_title(f"Epoch {iepoch} | Organelles - Predicted", fontsize=14, fontweight='bold')
+                        axes[1, 1].axis('off')
+
+                    plt.tight_layout()
+                    
+                    vis_save_path = save_path / "visualizations"
+                    vis_save_path.mkdir(exist_ok=True)
+                    vis_file = vis_save_path / f"epoch_{iepoch:04d}_eval_vis.png"
+                    plt.savefig(vis_file, bbox_inches='tight')
+                    plt.close(fig)
+                    train_logger.info(f">>> Full evaluation visual report saved to {vis_file}")
+                    
+                except Exception as e:
+                    train_logger.warning(f"Failed to generate full evaluation visualization: {e}")
+                    
+            # 6. Safety Cleanup - Free up GPU memory so the training loop can continue safely
+            del eval_model
+            torch.cuda.empty_cache()
 
         if iepoch == n_epochs - 1 or (iepoch % save_every == 0 and iepoch != 0):
             if save_each and iepoch != n_epochs - 1:  #separate files as model progresses
