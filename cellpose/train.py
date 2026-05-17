@@ -612,7 +612,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         lavg, nsum = 0, 0
 
         # --- EVALUATION AND VISUALIZATION EVERY 10 EPOCHS ---
-        if iepoch % 10 == 0 and iepoch > 0 and test_data is not None and organelles:
+        if iepoch % 5 == 0 and iepoch > 0 and test_data is not None and organelles:
             train_logger.info(f">>> Running requested full evaluation pipeline for Epoch {iepoch}...")
             
             # 1. Save weights explicitly for the eval block to load
