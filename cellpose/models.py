@@ -151,11 +151,27 @@ class CellposeModel():
                     else:
                         param.requires_grad = False
             
+            # 1. Save the original pre-trained head before we overwrite it!
+            original_head = self.net.out 
+            
+            # 2. Create the new Dual-Head Decoder
             model_dtype = next(self.net.parameters()).dtype
-            self.net.out = SwitchableDualHeadDecoder(
+            dual_head = SwitchableDualHeadDecoder(
                 in_channels=256, 
                 out_channels=192
             ).to(device=self.device, dtype=model_dtype)
+            
+            # 3. THE PRO MOVE: Copy the pre-trained weights into the new blank heads
+            if hasattr(original_head, 'weight') and hasattr(original_head, 'bias'):
+                models_logger.info(">>> Transferring pre-trained weights to Dual Heads...")
+                dual_head.cell_head.weight.data = original_head.weight.data.clone()
+                dual_head.cell_head.bias.data = original_head.bias.data.clone()
+                
+                dual_head.organelle_head.weight.data = original_head.weight.data.clone()
+                dual_head.organelle_head.bias.data = original_head.bias.data.clone()
+
+            # 4. Attach the new smart heads to the network
+            self.net.out = dual_head
 
         # --- LOAD WEIGHTS ---
         if custom_weights is not None and os.path.exists(custom_weights):
