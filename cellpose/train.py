@@ -404,8 +404,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     
     optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    # Initialize GradScaler for mixed precision stability
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
+    # Initialize GradScaler for mixed precision stability (Fixed deprecation warning)
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
 
     # Set Accumulation Steps (Simulates a larger batch size)
     accumulation_steps = 8
@@ -612,7 +612,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         lavg, nsum = 0, 0
 
         # --- EVALUATION AND VISUALIZATION EVERY 10 EPOCHS ---
-        if iepoch % 5 == 0 and iepoch > 0 and test_data is not None and organelles:
+        if iepoch % 10 == 0 and iepoch > 0 and test_data is not None and organelles:
             train_logger.info(f">>> Running requested full evaluation pipeline for Epoch {iepoch}...")
             
             # 1. Save weights explicitly for the eval block to load
@@ -624,7 +624,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             
             # 3. Run inference with active_head='both'
             train_logger.info(f">>> Running dual-head inference on {len(test_data)} test images...")
-            masks_both, flows_both, styles_both, diams_both = eval_model.eval(
+            masks_both, flows_both, styles_both = eval_model.eval(
                 test_data, 
                 batch_size=2, 
                 channels=[0,0], 
