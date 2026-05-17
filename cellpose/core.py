@@ -1,5 +1,5 @@
 """
-Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer , Michael Rariden and Marius Pachitariu.
+Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
 """
 import logging
 import numpy as np
@@ -130,13 +130,17 @@ def _to_device(x, device, dtype=torch.float32):
 def _from_device(X):
     """
     Converts a PyTorch tensor from the device to a NumPy array on the CPU.
+    Safely handles tuple outputs for multi-head models.
 
     Args:
-        X (torch.Tensor): The input PyTorch tensor.
+        X (torch.Tensor or tuple): The input PyTorch tensor or tuple of tensors.
 
     Returns:
-        numpy.ndarray: The converted NumPy array.
+        numpy.ndarray or tuple: The converted NumPy array(s).
     """
+    if isinstance(X, tuple):
+        return tuple(_from_device(x) for x in X)
+        
     # The cast is so numpy conversion always works
     x = X.detach().cpu().to(torch.float32).numpy()
     return x
@@ -165,7 +169,7 @@ def _forward(net, x):
 def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             rsz=None):
     """ 
-    Run network on stack of images.
+    Run network on stack of images. Natively supports single or multi-head tuple outputs.
     
     (faster if augment is False)
 
@@ -228,31 +232,68 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         for j in range(0, IMGa.shape[0], batch_size):
             bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
             ya0, stylea0 = _forward(net, IMGa[bslc])
+            
+            is_tuple = isinstance(ya0, tuple)
+            
             if j == 0:
-                nout = ya0.shape[1]
-                ya = np.zeros((IMGa.shape[0], nout, ly, lx), "float32")
+                if is_tuple:
+                    nout = [y.shape[1] for y in ya0]
+                    ya = tuple(np.zeros((IMGa.shape[0], n, ly, lx), "float32") for n in nout)
+                else:
+                    nout = ya0.shape[1]
+                    ya = np.zeros((IMGa.shape[0], nout, ly, lx), "float32")
                 stylea = np.zeros((IMGa.shape[0], 256), "float32")
-            ya[bslc] = ya0
+                
+            if is_tuple:
+                for y_arr, y_val in zip(ya, ya0):
+                    y_arr[bslc] = y_val
+            else:
+                ya[bslc] = ya0
+                
             stylea[bslc] = stylea0
 
         # average tiles
         for i, b in enumerate(inds):
             if i==0 and k==0:
-                yf = np.zeros((Lz, nout, Ly, Lx), "float32")
+                if is_tuple:
+                    yf = tuple(np.zeros((Lz, n, Ly, Lx), "float32") for n in nout)
+                else:
+                    yf = np.zeros((Lz, nout, Ly, Lx), "float32")
                 styles = np.zeros((Lz, 256), "float32")
-            y = ya[i * ntiles : (i + 1) * ntiles]
-            if augment:
-                y = np.reshape(y, (ny, nx, 3, ly, lx))
-                y = transforms.unaugment_tiles(y)
-                y = np.reshape(y, (-1, 3, ly, lx))
-            yfi = transforms.average_tiles(y, ysub, xsub, Lyt, Lxt)
-            yf[b] = yfi[:, :imgb.shape[-2], :imgb.shape[-1]]
+                
+            if is_tuple:
+                for idx, y_arr in enumerate(ya):
+                    y = y_arr[i * ntiles : (i + 1) * ntiles]
+                    if augment:
+                        y = np.reshape(y, (ny, nx, y.shape[1], ly, lx))
+                        y = transforms.unaugment_tiles(y)
+                        y = np.reshape(y, (-1, y.shape[2], ly, lx))
+                    yfi = transforms.average_tiles(y, ysub, xsub, Lyt, Lxt)
+                    yf[idx][b] = yfi[:, :imgb.shape[-2], :imgb.shape[-1]]
+            else:
+                y = ya[i * ntiles : (i + 1) * ntiles]
+                if augment:
+                    y = np.reshape(y, (ny, nx, y.shape[1], ly, lx))
+                    y = transforms.unaugment_tiles(y)
+                    y = np.reshape(y, (-1, y.shape[2], ly, lx))
+                yfi = transforms.average_tiles(y, ysub, xsub, Lyt, Lxt)
+                yf[b] = yfi[:, :imgb.shape[-2], :imgb.shape[-1]]
+            
             # stylei = stylea[i * ntiles:(i + 1) * ntiles].sum(axis=0)
             # stylei /= (stylei**2).sum()**0.5
             # styles[b] = stylei
+            
     # slices from padding
-    yf = yf[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
-    yf = yf.transpose(0,2,3,1)   
+    if is_tuple:
+        yf_out = []
+        for y_arr in yf:
+            y_arr = y_arr[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
+            yf_out.append(y_arr.transpose(0,2,3,1))
+        yf = tuple(yf_out)
+    else:
+        yf = yf[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
+        yf = yf.transpose(0,2,3,1)   
+        
     return yf, np.array(styles)
 
 
@@ -260,7 +301,7 @@ def run_3D(net, imgs, batch_size=8, augment=False,
            tile_overlap=0.1, bsize=224, net_ortho=None,
            progress=None):
     """ 
-    Run network on image z-stack.
+    Run network on image z-stack. Natively supports tuple outputs.
     
     (faster if augment is False)
 
@@ -286,7 +327,9 @@ def run_3D(net, imgs, batch_size=8, augment=False,
     cp = [(1, 2), (0, 2), (0, 1)]
     cpy = [(0, 1), (0, 1), (0, 1)]
     shape = imgs.shape[:-1]
-    yf = np.zeros((*shape, 4), "float32")
+    
+    yf = None
+    
     for p in range(3):
         xsl = imgs.transpose(pm[p])
         # per image
@@ -296,9 +339,25 @@ def run_3D(net, imgs, batch_size=8, augment=False,
                            xsl, batch_size=batch_size, augment=augment, 
                            bsize=bsize, tile_overlap=tile_overlap, 
                            rsz=None)
-        yf[..., -1] += y[..., -1].transpose(ipm[p])
-        for j in range(2):
-            yf[..., cp[p][j]] += y[..., cpy[p][j]].transpose(ipm[p])
+        
+        is_tuple = isinstance(y, tuple)
+        
+        if yf is None:
+            if is_tuple:
+                yf = tuple(np.zeros((*shape, 4), "float32") for _ in y)
+            else:
+                yf = np.zeros((*shape, 4), "float32")
+                
+        if is_tuple:
+            for idx, y_arr in enumerate(y):
+                yf[idx][..., -1] += y_arr[..., -1].transpose(ipm[p])
+                for j in range(2):
+                    yf[idx][..., cp[p][j]] += y_arr[..., cpy[p][j]].transpose(ipm[p])
+        else:
+            yf[..., -1] += y[..., -1].transpose(ipm[p])
+            for j in range(2):
+                yf[..., cp[p][j]] += y[..., cpy[p][j]].transpose(ipm[p])
+                
         y = None; del y
     
         if progress is not None:
