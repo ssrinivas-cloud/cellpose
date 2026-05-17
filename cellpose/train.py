@@ -401,8 +401,14 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     train_logger.info(
         f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}"
     )
-    optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate,
-                                    weight_decay=weight_decay)
+    
+    optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    # --- NEW: Initialize GradScaler for mixed precision stability ---
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
+
+    # --- NEW: Set Accumulation Steps (Simulates a larger batch size) ---
+    accumulation_steps = 8
 
     # DYNAMICALLY SET MULTI-HEAD MODE BEFORE LOOP
     if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
@@ -435,6 +441,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         net.train()
         if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
             net.out.active_head = 'both' if organelles else 'cells'
+
+        # --- NEW: Zero gradients BEFORE the inner loop begins ---
+        optimizer.zero_grad()
 
         for k in range(0, nimg_per_epoch, batch_size):
             kend = min(k + batch_size, nimg_per_epoch)
@@ -494,12 +503,29 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         loss_cell += _loss_fn_class(lbl, y_cell, class_weights=class_weights)
                     loss += loss_cell
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # --- NEW: Scale loss for gradient accumulation ---
+            loss = loss / accumulation_steps
+
+            # --- NEW: Use Scaler for backward pass ---
+            scaler.scale(loss).backward()
             
-            train_loss = loss.item()
-            train_loss *= len(imgi)
+            # --- NEW: Optimizer Step with Accumulation and Gradient Clipping ---
+            if (k // batch_size + 1) % accumulation_steps == 0 or (k + batch_size) >= nimg_per_epoch:
+                # Unscale gradients before clipping
+                scaler.unscale_(optimizer)
+                
+                # Clip gradients to prevent massive spikes
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+                
+                # Step and update scaler
+                scaler.step(optimizer)
+                scaler.update()
+                
+                # Zero out gradients for the next accumulation cycle
+                optimizer.zero_grad()
+            
+            # Correct the reported train loss to reflect the un-scaled magnitude
+            train_loss = (loss.item() * accumulation_steps) * len(imgi)
 
             # keep track of average training loss across epochs
             lavg += train_loss
