@@ -356,7 +356,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         if hf_repo_id and hf_token:
             train_logger.info(f">>> Uploading flows to Hugging Face Hub: {hf_repo_id}")
             try:
+                from huggingface_hub import HfApi
                 api = HfApi(token=hf_token)
+                api.create_repo(repo_id=hf_repo_id, exist_ok=True)
                 api.upload_folder(
                     folder_path=str(flows_dir),
                     path_in_repo="computed_flows",
@@ -385,17 +387,25 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     nimg_per_epoch = nimg if nimg_per_epoch is None else nimg_per_epoch
     nimg_test_per_epoch = nimg_test if nimg_test_per_epoch is None else nimg_test_per_epoch
 
-    # learning rate schedule
-    LR = np.linspace(0, learning_rate, 10)
-    LR = np.append(LR, learning_rate * np.ones(max(0, n_epochs - 10)))
-    if n_epochs > 300:
-        LR = LR[:-100]
-        for i in range(10):
-            LR = np.append(LR, LR[-1] / 2 * np.ones(10))
-    elif n_epochs > 99:
-        LR = LR[:-50]
-        for i in range(10):
-            LR = np.append(LR, LR[-1] / 2 * np.ones(5))
+    # ==========================================
+    # BETTER LR SCHEDULE: Cosine Annealing 
+    # ==========================================
+    warmup_epochs = min(10, n_epochs // 10) # Warmup for 10 epochs or 10% of total
+    cosine_epochs = max(0, n_epochs - warmup_epochs)
+    
+    # 1. Warmup (Linear increase from 0 to learning_rate)
+    LR_warmup = np.linspace(0, learning_rate, warmup_epochs)
+    
+    # 2. Cosine Decay (Smooth curve from learning_rate down to 1% of learning_rate)
+    min_lr = learning_rate * 0.01 
+    if cosine_epochs > 0:
+        steps = np.arange(cosine_epochs)
+        LR_cosine = min_lr + 0.5 * (learning_rate - min_lr) * (1 + np.cos(np.pi * steps / cosine_epochs))
+    else:
+        LR_cosine = np.array([])
+        
+    LR = np.concatenate([LR_warmup, LR_cosine])
+    # ==========================================
 
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
     train_logger.info(
@@ -770,7 +780,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     if hf_repo_id and hf_token:
         train_logger.info(f">>> Uploading model to Hugging Face Hub: {hf_repo_id}")
         try:
+            from huggingface_hub import HfApi
             api = HfApi(token=hf_token)
+            api.create_repo(repo_id=hf_repo_id, exist_ok=True)
             api.upload_file(
                 path_or_fileobj=str(filename),
                 path_in_repo=f"models/{model_name}",
