@@ -82,9 +82,6 @@ class SwitchableDualHeadDecoder(nn.Module):
             return self.cell_head(x)
         elif self.active_head == 'organelles':
             return self.organelle_head(x)
-        elif self.active_head == 'eval_both':
-            # MAGIC BYPASS: Concatenate along channels to survive core.run_net's rigid tiling
-            return torch.cat([self.cell_head(x), self.organelle_head(x)], dim=1)
         else:
             # If set to 'both', return the tuple (used by your train.py loop)
             return self.cell_head(x), self.organelle_head(x)
