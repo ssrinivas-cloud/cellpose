@@ -257,7 +257,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None,
               organelles=True, hf_repo_id=None, hf_token=None, save_flows=False, load_flows_dir=None, visualize=False,
-              debug=False):
+              debug=False, auto_unfreeze=False): # <--- ADDED auto_unfreeze
     
     if SGD:
         train_logger.warning("SGD is deprecated, using AdamW instead")
@@ -370,7 +370,23 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
     
-    optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    # ==========================================
+    # AUTO-UNFREEZE INITIALIZATION
+    # ==========================================
+    is_frozen = False
+    if auto_unfreeze:
+        is_frozen = True
+        train_logger.info("\n>>> [AUTO-UNFREEZE] Enabled! Starting Phase 1: FROZEN BACKBONE (Training Heads Only).")
+        for name, param in net.named_parameters():
+            if 'out' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        trainable_params = filter(lambda p: p.requires_grad, net.parameters())
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
     accumulation_steps = 8
 
@@ -387,6 +403,11 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
+    
+    # Auto-Unfreeze Trackers
+    best_loss = float('inf')
+    patience_counter = 0
+    plateau_patience = 5  # Epochs of no improvement before unfreezing
     
     for iepoch in range(n_epochs):
         np.random.seed(iepoch)
@@ -425,13 +446,12 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 outputs, style = net(X)
                 
                 # ==========================================
-                # DEBUG STATEMENT BLOCK (ACCURATE MASK COUNT)
+                # DEBUG STATEMENT BLOCK
                 # ==========================================
                 if debug and k == 0:
                     train_logger.info(f"\n[DEBUG] --- EPOCH {iepoch} BATCH 0 ---")
                     train_logger.info(f"[DEBUG] Input Data (X) -> Shape: {X.shape}, Dtype: {X.dtype}, Min: {X.min().item():.2f}, Max: {X.max().item():.2f}")
                     
-                    # FETCH REAL SPATIAL MASK FROM RAW LABELS
                     real_spatial_mask = train_labels[inds[0]][0]
                     actual_masks = max(0, len(np.unique(real_spatial_mask)) - 1)
                     
@@ -455,10 +475,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         train_logger.info(f"[DEBUG] Image 0 PREDICTED Masks (Logit > 0.0): {pred_cell_blobs}")
                         
                     train_logger.info(f"[DEBUG] ---------------------------\n")
-                # ==========================================
                 
                 # ==========================================
-                # CROSS-PENALIZATION LOSS BLOCK
+                # ISOLATED MULTI-TASK LOSS BLOCK (NO CROSS-PENALTY)
                 # ==========================================
                 if organelles:
                     y_cell, y_org = outputs
@@ -467,21 +486,17 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                     cell_mask = (batch_tasks_tensor == 0)
                     org_mask = (batch_tasks_tensor == 1)
 
-                    blank_lbl = torch.zeros_like(lbl)
-
                     if cell_mask.any():
                         loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
                         if y_cell.shape[1] > 3:
                             loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
                         loss += loss_cell
-                        loss += _loss_fn_seg(blank_lbl[cell_mask], y_org[cell_mask], device) # Penalize org head
                         
                     if org_mask.any():
                         loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
                         if y_org.shape[1] > 3:
                             loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
                         loss += loss_org
-                        loss += _loss_fn_seg(blank_lbl[org_mask], y_cell[org_mask], device) # Penalize cell head
                         
                 else:
                     y_cell = outputs
@@ -489,7 +504,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                     if y_cell.shape[1] > 3:
                         loss_cell += _loss_fn_class(lbl, y_cell, class_weights=class_weights)
                     loss += loss_cell
-                # ==========================================
 
             loss = loss / accumulation_steps
             scaler.scale(loss).backward()
@@ -507,6 +521,34 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             train_losses[iepoch] += train_loss
             
         train_losses[iepoch] /= nimg_per_epoch
+
+        # ==========================================
+        # AUTO-UNFREEZE PLATEAU CHECKER
+        # ==========================================
+        if is_frozen and iepoch >= (n_epochs // 2):
+            current_train_loss = train_losses[iepoch]
+            
+            if current_train_loss < best_loss - 1e-4:
+                best_loss = current_train_loss
+                patience_counter = 0 # Reset patience
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= plateau_patience:
+                train_logger.info(f"\n>>> [AUTO-UNFREEZE] Plateau detected (loss {current_train_loss:.4f} hasn't improved).")
+                train_logger.info(">>> Starting Phase 2: UNFREEZING BACKBONE for End-to-End Fine-Tuning!")
+                
+                # Unfreeze everything
+                for name, param in net.named_parameters():
+                    param.requires_grad = True
+                    
+                # Scale down remaining learning rate schedule to protect the ViT
+                LR[iepoch:] = LR[iepoch:] * 0.1
+                
+                # Rebuild optimizer with all parameters
+                optimizer = torch.optim.AdamW(net.parameters(), lr=LR[iepoch], weight_decay=weight_decay)
+                is_frozen = False
+        # ==========================================
 
         if iepoch == 5 or iepoch % 10 == 0:
             lavgt = 0.
@@ -545,27 +587,23 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
                             outputs, style = net(X)
                             
-                            # TEST EVALUATION CROSS-PENALIZATION
                             if organelles:
                                 y_cell, y_org = outputs
                                 batch_tasks_tensor = torch.tensor(batch_tasks, device=device)
                                 cell_mask = (batch_tasks_tensor == 0)
                                 org_mask = (batch_tasks_tensor == 1)
-                                blank_lbl = torch.zeros_like(lbl)
 
                                 if cell_mask.any():
                                     loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
                                     if y_cell.shape[1] > 3:
                                         loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
                                     loss += loss_cell
-                                    loss += _loss_fn_seg(blank_lbl[cell_mask], y_org[cell_mask], device)
                                     
                                 if org_mask.any():
                                     loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
                                     if y_org.shape[1] > 3:
                                         loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
                                     loss += loss_org
-                                    loss += _loss_fn_seg(blank_lbl[org_mask], y_cell[org_mask], device)
                             else:
                                 y_cell = outputs
                                 loss_cell = _loss_fn_seg(lbl, y_cell, device)
