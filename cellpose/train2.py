@@ -28,7 +28,19 @@ def _loss_fn_seg(lbl, y, device):
     return loss
 
 def _get_batch(inds, data=None, labels_c=None, labels_o=None):
-    imgs = [data[i] for i in inds]
+    imgs = []
+    for i in inds:
+        img = data[i].copy()
+        
+        # 1. SHAPE FIX: If the image is (Height, Width, Channels), swap to (Channels, Height, Width)
+        if img.ndim == 3 and img.shape[-1] == 3:
+            img = img.transpose(2, 0, 1)
+            
+        # 2. NORMALIZATION FIX: Standardize pixel values so the network doesn't explode
+        img = normalize_img(img, axis=0) 
+        
+        imgs.append(img)
+        
     # Slice [1:] to remove the raw instance mask, keeping [FlowY, FlowX, Cellprob]
     lbls_c = [labels_c[i][1:] for i in inds] 
     lbls_o = [labels_o[i][1:] for i in inds]
@@ -172,6 +184,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 # ==========================================
                 if debug and k == 0:
                     train_logger.info(f"\n[DEBUG] --- EPOCH {iepoch} BATCH 0 ---")
+                    train_logger.info(f"[DEBUG] Input Data (X) -> Shape: {X.shape}, Min: {X.min().item():.2f}, Max: {X.max().item():.2f}")
                     pred_cell_blobs = scipy.ndimage.label((y_cell[0, -1] > 0.0).detach().cpu().numpy())[1]
                     pred_org_blobs = scipy.ndimage.label((y_org[0, -1] > 0.0).detach().cpu().numpy())[1]
                     train_logger.info(f"[DEBUG] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
