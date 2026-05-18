@@ -291,7 +291,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None,
-              organelles=True, hf_repo_id=None, hf_token=None, save_flows=False, load_flows_dir=None, visualize=False):
+              organelles=True, hf_repo_id=None, hf_token=None, save_flows=False, load_flows_dir=None, visualize=False,
+              debug=False):  # <--- Added debug parameter
     
     if SGD:
         train_logger.warning("SGD is deprecated, using AdamW instead")
@@ -414,7 +415,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     
     optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    # Initialize GradScaler for mixed precision stability (Fixed deprecation warning)
+    # Initialize GradScaler for mixed precision stability
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
 
     # Set Accumulation Steps (Simulates a larger batch size)
@@ -481,6 +482,43 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             with torch.autocast(device_type=device.type, dtype=net.dtype):
                 # PROPERLY UNPACK OUTPUTS AND STYLE
                 outputs, style = net(X)
+                
+                # ==========================================
+                # DEBUG STATEMENT BLOCK
+                # ==========================================
+                if debug and k == 0:
+                    import scipy.ndimage
+                    train_logger.info(f"\n[DEBUG] --- EPOCH {iepoch} BATCH 0 ---")
+                    train_logger.info(f"[DEBUG] Input Data (X) -> Shape: {X.shape}, Dtype: {X.dtype}, Min: {X.min().item():.2f}, Max: {X.max().item():.2f}")
+                    
+                    if organelles:
+                        y_cell_dbg, y_org_dbg = outputs
+                        train_logger.info(f"[DEBUG] Model Output -> y_cell Shape: {y_cell_dbg.shape}, y_org Shape: {y_org_dbg.shape}")
+                        
+                        # Count actual masks for the very first image in the batch (subtracting 0 for background)
+                        actual_masks = max(0, len(torch.unique(lbl[0, 0])) - 1)
+                        task_type = "Organelles" if batch_tasks[0] == 1 else "Cells"
+                        
+                        # Count predicted masks using a proxy (counting blobs where logit > 0)
+                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > 0).detach().cpu().numpy())[1]
+                        pred_org_blobs = scipy.ndimage.label((y_org_dbg[0, -1] > 0).detach().cpu().numpy())[1]
+                        
+                        train_logger.info(f"[DEBUG] Image 0 Task Assignment: {task_type}")
+                        train_logger.info(f"[DEBUG] Image 0 ACTUAL Ground Truth Masks: {actual_masks}")
+                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Cell Masks (Logit > 0): {pred_cell_blobs}")
+                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Org Masks (Logit > 0): {pred_org_blobs}")
+                    else:
+                        y_cell_dbg = outputs
+                        train_logger.info(f"[DEBUG] Model Output -> y_cell Shape: {y_cell_dbg.shape}")
+                        
+                        actual_masks = max(0, len(torch.unique(lbl[0, 0])) - 1)
+                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > 0).detach().cpu().numpy())[1]
+                        
+                        train_logger.info(f"[DEBUG] Image 0 ACTUAL Ground Truth Masks: {actual_masks}")
+                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Masks (Logit > 0): {pred_cell_blobs}")
+                        
+                    train_logger.info(f"[DEBUG] ---------------------------\n")
+                # ==========================================
                 
                 # BRANCH BASED ON `organelles` FLAG
                 if organelles:
@@ -705,18 +743,22 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         gt_mask_c = gt_cells_only[0]
                         pred_mask_c = pred_cells_only[0]
                         
+                        # Count the masks
+                        num_gt_c = len(np.unique(gt_mask_c[gt_mask_c > 0]))
+                        num_pred_c = len(np.unique(pred_mask_c[pred_mask_c > 0]))
+                        
                         # Top-Left: Cell GT
                         axes[0, 0].imshow(img_disp_c)
                         if np.any(gt_mask_c > 0):
                             axes[0, 0].contour(gt_mask_c, levels=np.unique(gt_mask_c), colors='lime', linewidths=1.0)
-                        axes[0, 0].set_title(f"Epoch {iepoch} | Cells - Actual GT", fontsize=14, fontweight='bold')
+                        axes[0, 0].set_title(f"Epoch {iepoch} | Cells - Actual GT (n={num_gt_c})", fontsize=14, fontweight='bold')
                         axes[0, 0].axis('off')
                         
                         # Top-Right: Cell Prediction
                         axes[0, 1].imshow(img_disp_c)
                         if np.any(pred_mask_c > 0):
                             axes[0, 1].contour(pred_mask_c, levels=np.unique(pred_mask_c), colors='red', linewidths=1.0)
-                        axes[0, 1].set_title(f"Epoch {iepoch} | Cells - Predicted", fontsize=14, fontweight='bold')
+                        axes[0, 1].set_title(f"Epoch {iepoch} | Cells - Predicted (n={num_pred_c})", fontsize=14, fontweight='bold')
                         axes[0, 1].axis('off')
                         
                     # Plot Row 1: Organelles
@@ -732,18 +774,22 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         gt_mask_o = gt_orgs_only[0]
                         pred_mask_o = pred_orgs_only[0]
                         
+                        # Count the masks
+                        num_gt_o = len(np.unique(gt_mask_o[gt_mask_o > 0]))
+                        num_pred_o = len(np.unique(pred_mask_o[pred_mask_o > 0]))
+                        
                         # Bottom-Left: Organelle GT
                         axes[1, 0].imshow(img_disp_o)
                         if np.any(gt_mask_o > 0):
                             axes[1, 0].contour(gt_mask_o, levels=np.unique(gt_mask_o), colors='lime', linewidths=1.0)
-                        axes[1, 0].set_title(f"Epoch {iepoch} | Organelles - Actual GT", fontsize=14, fontweight='bold')
+                        axes[1, 0].set_title(f"Epoch {iepoch} | Organelles - Actual GT (n={num_gt_o})", fontsize=14, fontweight='bold')
                         axes[1, 0].axis('off')
                         
                         # Bottom-Right: Organelle Prediction
                         axes[1, 1].imshow(img_disp_o)
                         if np.any(pred_mask_o > 0):
                             axes[1, 1].contour(pred_mask_o, levels=np.unique(pred_mask_o), colors='red', linewidths=1.0)
-                        axes[1, 1].set_title(f"Epoch {iepoch} | Organelles - Predicted", fontsize=14, fontweight='bold')
+                        axes[1, 1].set_title(f"Epoch {iepoch} | Organelles - Predicted (n={num_pred_o})", fontsize=14, fontweight='bold')
                         axes[1, 1].axis('off')
 
                     plt.tight_layout()
