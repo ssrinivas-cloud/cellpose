@@ -1,6 +1,7 @@
 import time
 import os
 import numpy as np
+import scipy.ndimage
 from cellpose import io, utils, models, dynamics
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
@@ -23,12 +24,9 @@ def _loss_fn_class(lbl, y, class_weights=None):
         
     Returns:
         torch.Tensor: Loss value.
-
     """
-
     criterion3 = nn.CrossEntropyLoss(reduction="mean", weight=class_weights)
     loss3 = criterion3(y[:, :-3], lbl[:, 0].long())
-    
     return loss3
 
 def _loss_fn_seg(lbl, y, device):
@@ -42,7 +40,6 @@ def _loss_fn_seg(lbl, y, device):
 
     Returns:
         torch.Tensor: Loss value.
-
     """
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
@@ -56,13 +53,6 @@ def _loss_fn_seg(lbl, y, device):
 def _reshape_norm(data, channel_axis=None, normalize_params={"normalize": False}):
     """
     Reshapes and normalizes the input data.
-
-    Args:
-        data (list): List of input data, with channels axis first or last.
-        normalize_params (dict, optional): Dictionary of normalization parameters. Defaults to {"normalize": False}.
-
-    Returns:
-        list: List of reshaped and normalized data.
     """
     if (np.array([td.ndim!=3 for td in data]).sum() > 0 or
         np.array([td.shape[0]!=3 for td in data]).sum() > 0):
@@ -70,9 +60,8 @@ def _reshape_norm(data, channel_axis=None, normalize_params={"normalize": False}
         for td in data:
             if td.ndim == 3:
                 channel_axis0 = channel_axis if channel_axis is not None else np.array(td.shape).argmin()
-                # put channel axis first 
                 td = np.moveaxis(td, channel_axis0, 0)
-                td = td[:3] # keep at most 3 channels
+                td = td[:3] 
             if td.ndim == 2 or (td.ndim == 3 and td.shape[0] == 1):
                 td = np.stack((td, 0*td, 0*td), axis=0)
             elif td.ndim == 3 and td.shape[0] < 3:
@@ -89,19 +78,7 @@ def _reshape_norm(data, channel_axis=None, normalize_params={"normalize": False}
 def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
                normalize_params={"normalize": False}, tasks=None):
     """
-    Get a batch of images and labels.
-
-    Args:
-        inds (list): List of indices indicating which images and labels to retrieve.
-        data (list or None): List of image data. If None, images will be loaded from files.
-        labels (list or None): List of label data. If None, labels will be loaded from files.
-        files (list or None): List of file paths for images.
-        labels_files (list or None): List of file paths for labels.
-        normalize_params (dict): Dictionary of parameters for image normalization (will be faster, if loading from files to pre-normalize).
-        tasks (list or None): List of task tags (0 for cell, 1 for organelle).
-
-    Returns:
-        tuple: A tuple containing lists: the batch of images, labels, and tasks.
+    Get a batch of images, labels, and tasks.
     """
     if data is None:
         lbls = None
@@ -113,14 +90,12 @@ def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
         imgs = [data[i] for i in inds]
         lbls = [labels[i][1:] for i in inds]
         
-    # Grab the task identifiers for this specific batch
     batch_tasks = [tasks[i] for i in inds] if tasks is not None else [0] * len(inds)
     
     return imgs, lbls, batch_tasks
 
 def _reshape_norm_save(files, channels=None, channel_axis=None,
                        normalize_params={"normalize": False}):
-    """ not currently used -- normalization happening on each batch if not load_files """
     files_new = []
     for f in trange(files):
         td = io.imread(f)
@@ -148,11 +123,9 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('mps') if torch.backends.mps.is_available() else None
     
     if train_data is not None and train_labels is not None:
-        # if data is loaded
         nimg = len(train_data)
         nimg_test = len(test_data) if test_data is not None else None
     else:
-        # otherwise use files
         nimg = len(train_files)
         if train_labels_files is None:
             train_labels_files = [
@@ -168,7 +141,6 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
         if not load_files:
             train_logger.info(">>> using files instead of loading dataset")
         else:
-            # load all images
             train_logger.info(">>> loading images and labels")
             train_data = [io.imread(train_files[i]) for i in trange(nimg)]
             train_labels = [io.imread(train_labels_files[i]) for i in trange(nimg)]
@@ -177,7 +149,6 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
             test_data = [io.imread(test_files[i]) for i in trange(nimg_test)]
             test_labels = [io.imread(test_labels_files[i]) for i in trange(nimg_test)]
 
-    ### check that arrays are correct size
     if ((train_labels is not None and nimg != len(train_labels)) or
         (train_labels_files is not None and nimg != len(train_labels_files))):
         error_message = "train data and labels not same length"
@@ -197,7 +168,6 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
             train_logger.critical(error_message)
             raise ValueError(error_message)
 
-    ### check that flows are computed
     if train_labels is not None:
         train_labels = dynamics.labels_to_flows(train_labels, files=train_files,
                                                 device=device)
@@ -213,7 +183,6 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
                 tl = dynamics.labels_to_flows(io.imread(test_labels_files),
                                               files=test_files, device=device)
 
-    ### compute diameters
     nmasks = np.zeros(nimg)
     diam_train = np.zeros(nimg)
     train_logger.info(">>> computing diameters")
@@ -236,7 +205,6 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
     else:
         diam_test = None
 
-    ### check to remove training images with too few masks
     if min_train_masks > 0:
         nremove = (nmasks < min_train_masks).sum()
         if nremove > 0:
@@ -256,16 +224,13 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
             diam_train = diam_train[ikeep]
             nimg = len(train_data)
 
-    ### normalize probabilities
-    train_probs = 1. / nimg * np.ones(nimg,
-                                      "float64") if train_probs is None else train_probs
+    train_probs = 1. / nimg * np.ones(nimg, "float64") if train_probs is None else train_probs
     train_probs /= train_probs.sum()
     if test_files is not None or test_data is not None:
         test_probs = 1. / nimg_test * np.ones(
             nimg_test, "float64") if test_probs is None else test_probs
         test_probs /= test_probs.sum()
 
-    ### reshape and normalize train / test data
     normed = False
     if normalize_params["normalize"]:
         train_logger.info(f">>> normalizing {normalize_params}")
@@ -292,13 +257,12 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None,
               organelles=True, hf_repo_id=None, hf_token=None, save_flows=False, load_flows_dir=None, visualize=False,
-              debug=False):  # <--- Added debug parameter
+              debug=False):
     
     if SGD:
         train_logger.warning("SGD is deprecated, using AdamW instead")
 
     device = net.device
-
     original_net_dtype = net.dtype 
     if net.dtype == torch.bfloat16:
         train_logger.info(">>> converting bfloat16 network to float32 for training")
@@ -370,7 +334,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             except Exception as e:
                 train_logger.error(f">>> Failed to upload flows to Hugging Face: {e}")
 
-    # already normalized, do not normalize during training
     if normed:
         kwargs = {}
     else:
@@ -380,7 +343,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     if class_weights is not None and isinstance(class_weights, (list, np.ndarray, tuple)):
         class_weights = torch.from_numpy(class_weights).to(device).float()
-        print(class_weights)
 
     nimg = len(train_data) if train_data is not None else len(train_files)
     nimg_test = len(test_data) if test_data is not None else None
@@ -391,13 +353,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     # ==========================================
     # BETTER LR SCHEDULE: Cosine Annealing 
     # ==========================================
-    warmup_epochs = min(10, n_epochs // 10) # Warmup for 10 epochs or 10% of total
+    warmup_epochs = min(10, n_epochs // 10) 
     cosine_epochs = max(0, n_epochs - warmup_epochs)
     
-    # 1. Warmup (Linear increase from 0 to learning_rate)
     LR_warmup = np.linspace(0, learning_rate, warmup_epochs)
-    
-    # 2. Cosine Decay (Smooth curve from learning_rate down to 1% of learning_rate)
     min_lr = learning_rate * 0.01 
     if cosine_epochs > 0:
         steps = np.arange(cosine_epochs)
@@ -409,19 +368,12 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     # ==========================================
 
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
-    train_logger.info(
-        f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}"
-    )
+    train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
     
     optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
-    # Initialize GradScaler for mixed precision stability
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
-
-    # Set Accumulation Steps (Simulates a larger batch size)
     accumulation_steps = 8
 
-    # DYNAMICALLY SET MULTI-HEAD MODE BEFORE LOOP
     if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
         net.out.active_head = 'both' if organelles else 'cells'
 
@@ -439,146 +391,119 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     for iepoch in range(n_epochs):
         np.random.seed(iepoch)
         if nimg != nimg_per_epoch:
-            # choose random images for epoch with probability train_probs
-            rperm = np.random.choice(np.arange(0, nimg), size=(nimg_per_epoch,),
-                                     p=train_probs)
+            rperm = np.random.choice(np.arange(0, nimg), size=(nimg_per_epoch,), p=train_probs)
         else:
-            # otherwise use all images
             rperm = np.random.permutation(np.arange(0, nimg))
             
         for param_group in optimizer.param_groups:
-            param_group["lr"] = LR[iepoch] # set learning rate
+            param_group["lr"] = LR[iepoch]
             
         net.train()
         if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
             net.out.active_head = 'both' if organelles else 'cells'
 
-        # Zero gradients BEFORE the inner loop begins
         optimizer.zero_grad()
 
         for k in range(0, nimg_per_epoch, batch_size):
             kend = min(k + batch_size, nimg_per_epoch)
             inds = rperm[k:kend]
             
-            # Fetch batch tasks alongside images and labels
             imgs, lbls, batch_tasks = _get_batch(inds, data=train_data, labels=train_labels,
                                                  files=train_files, labels_files=train_labels_files,
                                                  tasks=train_tasks, **kwargs)
             diams = np.array([diam_train[i] for i in inds])
-            rsc = diams / net.diam_mean.item() if rescale else np.ones(
-                len(diams), "float32")
+            rsc = diams / net.diam_mean.item() if rescale else np.ones(len(diams), "float32")
                 
-            # augmentations
-            imgi, lbl = random_rotate_and_resize(imgs, Y=lbls, rescale=rsc,
-                                                 scale_range=scale_range,
-                                                 xy=(bsize, bsize))[:2]
+            imgi, lbl = random_rotate_and_resize(imgs, Y=lbls, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
                                                  
-            # network and loss optimization
             X = torch.from_numpy(imgi).to(device)
             lbl = torch.from_numpy(lbl).to(device)
             
             loss = torch.tensor(0.0, device=device)
 
             with torch.autocast(device_type=device.type, dtype=net.dtype):
-                # PROPERLY UNPACK OUTPUTS AND STYLE
                 outputs, style = net(X)
                 
                 # ==========================================
-                # DEBUG STATEMENT BLOCK
+                # DEBUG STATEMENT BLOCK (ACCURATE MASK COUNT)
                 # ==========================================
                 if debug and k == 0:
-                    import scipy.ndimage
                     train_logger.info(f"\n[DEBUG] --- EPOCH {iepoch} BATCH 0 ---")
                     train_logger.info(f"[DEBUG] Input Data (X) -> Shape: {X.shape}, Dtype: {X.dtype}, Min: {X.min().item():.2f}, Max: {X.max().item():.2f}")
+                    
+                    # FETCH REAL SPATIAL MASK FROM RAW LABELS
+                    real_spatial_mask = train_labels[inds[0]][0]
+                    actual_masks = max(0, len(np.unique(real_spatial_mask)) - 1)
                     
                     if organelles:
                         y_cell_dbg, y_org_dbg = outputs
                         train_logger.info(f"[DEBUG] Model Output -> y_cell Shape: {y_cell_dbg.shape}, y_org Shape: {y_org_dbg.shape}")
                         
-                        # Count actual masks for the very first image in the batch (subtracting 0 for background)
-                        actual_masks = max(0, len(torch.unique(lbl[0, 0])) - 1)
                         task_type = "Organelles" if batch_tasks[0] == 1 else "Cells"
-                        
-                        # Count predicted masks using a proxy (counting blobs where logit > 0)
-                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > 0).detach().cpu().numpy())[1]
-                        pred_org_blobs = scipy.ndimage.label((y_org_dbg[0, -1] > 0).detach().cpu().numpy())[1]
+                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > -2.0).detach().cpu().numpy())[1]
+                        pred_org_blobs = scipy.ndimage.label((y_org_dbg[0, -1] > -2.0).detach().cpu().numpy())[1]
                         
                         train_logger.info(f"[DEBUG] Image 0 Task Assignment: {task_type}")
                         train_logger.info(f"[DEBUG] Image 0 ACTUAL Ground Truth Masks: {actual_masks}")
-                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Cell Masks (Logit > 0): {pred_cell_blobs}")
-                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Org Masks (Logit > 0): {pred_org_blobs}")
+                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Cell Masks (Logit > -2.0): {pred_cell_blobs}")
+                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Org Masks (Logit > -2.0): {pred_org_blobs}")
                     else:
                         y_cell_dbg = outputs
+                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > -2.0).detach().cpu().numpy())[1]
                         train_logger.info(f"[DEBUG] Model Output -> y_cell Shape: {y_cell_dbg.shape}")
-                        
-                        actual_masks = max(0, len(torch.unique(lbl[0, 0])) - 1)
-                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > 0).detach().cpu().numpy())[1]
-                        
                         train_logger.info(f"[DEBUG] Image 0 ACTUAL Ground Truth Masks: {actual_masks}")
-                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Masks (Logit > 0): {pred_cell_blobs}")
+                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Masks (Logit > -2.0): {pred_cell_blobs}")
                         
                     train_logger.info(f"[DEBUG] ---------------------------\n")
                 # ==========================================
                 
-                # BRANCH BASED ON `organelles` FLAG
+                # ==========================================
+                # CROSS-PENALIZATION LOSS BLOCK
+                # ==========================================
                 if organelles:
                     y_cell, y_org = outputs
                     
-                    # Convert tasks to tensor for boolean masking
                     batch_tasks_tensor = torch.tensor(batch_tasks, device=device)
                     cell_mask = (batch_tasks_tensor == 0)
                     org_mask = (batch_tasks_tensor == 1)
 
-                    # Route cell loss
+                    blank_lbl = torch.zeros_like(lbl)
+
                     if cell_mask.any():
                         loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
                         if y_cell.shape[1] > 3:
                             loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
                         loss += loss_cell
+                        loss += _loss_fn_seg(blank_lbl[cell_mask], y_org[cell_mask], device) # Penalize org head
                         
-                    # Route organelle loss
                     if org_mask.any():
                         loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
                         if y_org.shape[1] > 3:
                             loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
                         loss += loss_org
+                        loss += _loss_fn_seg(blank_lbl[org_mask], y_cell[org_mask], device) # Penalize cell head
                         
                 else:
-                    # STANDARD SINGLE-HEAD LOGIC
                     y_cell = outputs
                     loss_cell = _loss_fn_seg(lbl, y_cell, device)
                     if y_cell.shape[1] > 3:
                         loss_cell += _loss_fn_class(lbl, y_cell, class_weights=class_weights)
                     loss += loss_cell
+                # ==========================================
 
-            # Scale loss for gradient accumulation
             loss = loss / accumulation_steps
-
-            # Use Scaler for backward pass
             scaler.scale(loss).backward()
             
-            # Optimizer Step with Accumulation and Gradient Clipping
             if (k // batch_size + 1) % accumulation_steps == 0 or (k + batch_size) >= nimg_per_epoch:
-                # Unscale gradients before clipping
                 scaler.unscale_(optimizer)
-                
-                # Clip gradients to prevent massive spikes
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-                
-                # Step and update scaler
                 scaler.step(optimizer)
                 scaler.update()
-                
-                # Zero out gradients for the next accumulation cycle
                 optimizer.zero_grad()
             
-            # Correct the reported train loss to reflect the un-scaled magnitude
             train_loss = (loss.item() * accumulation_steps) * len(imgi)
-
-            # keep track of average training loss across epochs
             lavg += train_loss
             nsum += len(imgi)
-            # per epoch training loss
             train_losses[iepoch] += train_loss
             
         train_losses[iepoch] /= nimg_per_epoch
@@ -620,24 +545,27 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
                             outputs, style = net(X)
                             
+                            # TEST EVALUATION CROSS-PENALIZATION
                             if organelles:
                                 y_cell, y_org = outputs
-                                
                                 batch_tasks_tensor = torch.tensor(batch_tasks, device=device)
                                 cell_mask = (batch_tasks_tensor == 0)
                                 org_mask = (batch_tasks_tensor == 1)
+                                blank_lbl = torch.zeros_like(lbl)
 
                                 if cell_mask.any():
                                     loss_cell = _loss_fn_seg(lbl[cell_mask], y_cell[cell_mask], device)
                                     if y_cell.shape[1] > 3:
                                         loss_cell += _loss_fn_class(lbl[cell_mask], y_cell[cell_mask], class_weights=class_weights)
                                     loss += loss_cell
+                                    loss += _loss_fn_seg(blank_lbl[cell_mask], y_org[cell_mask], device)
                                     
                                 if org_mask.any():
                                     loss_org = _loss_fn_seg(lbl[org_mask], y_org[org_mask], device)
                                     if y_org.shape[1] > 3:
                                         loss_org += _loss_fn_class(lbl[org_mask], y_org[org_mask], class_weights=class_weights)
                                     loss += loss_org
+                                    loss += _loss_fn_seg(blank_lbl[org_mask], y_cell[org_mask], device)
                             else:
                                 y_cell = outputs
                                 loss_cell = _loss_fn_seg(lbl, y_cell, device)
@@ -652,7 +580,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 lavgt /= len(rperm)
                 test_losses[iepoch] = lavgt
                 
-        # Calculate and log per-epoch stats
         lavg /= nsum
         train_logger.info(
             f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
@@ -661,60 +588,49 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
         # --- EVALUATION AND VISUALIZATION EVERY 10 EPOCHS ---
         if iepoch % 10 == 0 and iepoch > 0 and test_data is not None and organelles:
+            import numpy.ma as ma
             train_logger.info(f">>> Running requested full evaluation pipeline for Epoch {iepoch}...")
             
-            # 1. Save weights explicitly for the eval block to load
             temp_model_path = str(filename) + f"_eval_temp_epoch_{iepoch:04d}"
             net.save_model(temp_model_path)
             
-            # 2. Load the model using custom_weights to inject the dual-head architecture
             eval_model = models.CellposeModel(gpu=True, custom_weights=temp_model_path)
             
-            # 3. Run inference with active_head='both'
             train_logger.info(f">>> Running dual-head inference on {len(test_data)} test images...")
             masks_both, flows_both, styles_both = eval_model.eval(
                 test_data, 
                 batch_size=2, 
                 channels=[0,0], 
-                cellprob_threshold=0.0, 
-                rescale=1.0,               # Change this if you used a specific rescale factor
-                active_head='both'         # <--- The magic switch
+                cellprob_threshold=-2.0, 
+                rescale=1.0,               
+                active_head='both'         
             )
             
-            # masks_both contains a pair of masks [Cell_Mask, Org_Mask] for EACH image
-            # We unpack them into two separate lists across all images
             pred_cells = [m[0] for m in masks_both]
             pred_orgs = [m[1] for m in masks_both]
             
-            # 4. Helper Function for Pixel-Wise Metrics
             def calculate_metrics(gt_masks, pred_masks):
                 tp = fp = fn = 0
                 for gt, pred in zip(gt_masks, pred_masks):
-                    # Binarize masks for Pixel-wise logic
                     gt_bin = gt > 0
                     pred_bin = pred > 0
-                    
                     tp += np.logical_and(gt_bin, pred_bin).sum()
-                    fp += np.logical_and(~gt_bin, pred_bin).sum()  # gt == 0 and pred > 0
-                    fn += np.logical_and(gt_bin, ~pred_bin).sum()  # gt > 0 and pred == 0
+                    fp += np.logical_and(~gt_bin, pred_bin).sum()  
+                    fn += np.logical_and(gt_bin, ~pred_bin).sum()  
 
                 iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
                 f1 = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
                 return iou, f1
             
-            # Extract dynamically using test_tasks (0 = Cells, 1 = Organelles)
             cell_indices = [i for i, t in enumerate(test_tasks) if t == 0]
             org_indices = [i for i, t in enumerate(test_tasks) if t == 1]
             
-            # Slice out the cell ground truths and predictions
-            gt_cells_only = [test_labels[i][0] for i in cell_indices] # Extract spatial mask
+            gt_cells_only = [test_labels[i][0] for i in cell_indices]
             pred_cells_only = [pred_cells[i] for i in cell_indices]
 
-            # Slice out the organelle ground truths and predictions
-            gt_orgs_only = [test_labels[i][0] for i in org_indices]   # Extract spatial mask
+            gt_orgs_only = [test_labels[i][0] for i in org_indices]
             pred_orgs_only = [pred_orgs[i] for i in org_indices]
             
-            # Compute
             iou_cells, f1_cells = calculate_metrics(gt_cells_only, pred_cells_only)
             iou_orgs, f1_orgs = calculate_metrics(gt_orgs_only, pred_orgs_only)
 
@@ -722,20 +638,16 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             train_logger.info(f"CELLS      | IOU: {iou_cells:.4f} | F1: {f1_cells:.4f}")
             train_logger.info(f"ORGANELLES | IOU: {iou_orgs:.4f} | F1: {f1_orgs:.4f}")
 
-            # 5. Visualization Block (2x2 Grid)
             if visualize:
                 try:
                     import matplotlib.pyplot as plt
-                    import matplotlib.patches as mpatches
                     
                     fig, axes = plt.subplots(2, 2, figsize=(14, 14))
                     
-                    # Plot Row 0: Cells
                     if len(cell_indices) > 0:
-                        c_idx = cell_indices[0] # Grab first available cell image
+                        c_idx = cell_indices[0]
                         img_c = test_data[c_idx]
                         
-                        # Format image array for matplotlib
                         img_disp_c = img_c.transpose(1, 2, 0) if img_c.shape[0] == 3 else img_c
                         if img_disp_c.max() > 1.0:
                             img_disp_c = (img_disp_c - img_disp_c.min()) / (img_disp_c.max() - img_disp_c.min())
@@ -743,30 +655,27 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         gt_mask_c = gt_cells_only[0]
                         pred_mask_c = pred_cells_only[0]
                         
-                        # Count the masks
                         num_gt_c = len(np.unique(gt_mask_c[gt_mask_c > 0]))
                         num_pred_c = len(np.unique(pred_mask_c[pred_mask_c > 0]))
                         
-                        # Top-Left: Cell GT
-                        axes[0, 0].imshow(img_disp_c)
+                        axes[0, 0].imshow(img_disp_c, cmap='gray')
                         if np.any(gt_mask_c > 0):
-                            axes[0, 0].contour(gt_mask_c, levels=np.unique(gt_mask_c), colors='lime', linewidths=1.0)
+                            overlay_gt_c = ma.masked_where(gt_mask_c == 0, gt_mask_c)
+                            axes[0, 0].imshow(overlay_gt_c, cmap='prism', alpha=0.4, interpolation='none')
                         axes[0, 0].set_title(f"Epoch {iepoch} | Cells - Actual GT (n={num_gt_c})", fontsize=14, fontweight='bold')
                         axes[0, 0].axis('off')
                         
-                        # Top-Right: Cell Prediction
-                        axes[0, 1].imshow(img_disp_c)
+                        axes[0, 1].imshow(img_disp_c, cmap='gray')
                         if np.any(pred_mask_c > 0):
-                            axes[0, 1].contour(pred_mask_c, levels=np.unique(pred_mask_c), colors='red', linewidths=1.0)
+                            overlay_pred_c = ma.masked_where(pred_mask_c == 0, pred_mask_c)
+                            axes[0, 1].imshow(overlay_pred_c, cmap='prism', alpha=0.4, interpolation='none')
                         axes[0, 1].set_title(f"Epoch {iepoch} | Cells - Predicted (n={num_pred_c})", fontsize=14, fontweight='bold')
                         axes[0, 1].axis('off')
                         
-                    # Plot Row 1: Organelles
                     if len(org_indices) > 0:
-                        o_idx = org_indices[0] # Grab first available organelle image
+                        o_idx = org_indices[0]
                         img_o = test_data[o_idx]
                         
-                        # Format image array for matplotlib
                         img_disp_o = img_o.transpose(1, 2, 0) if img_o.shape[0] == 3 else img_o
                         if img_disp_o.max() > 1.0:
                             img_disp_o = (img_disp_o - img_disp_o.min()) / (img_disp_o.max() - img_disp_o.min())
@@ -774,21 +683,20 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         gt_mask_o = gt_orgs_only[0]
                         pred_mask_o = pred_orgs_only[0]
                         
-                        # Count the masks
                         num_gt_o = len(np.unique(gt_mask_o[gt_mask_o > 0]))
                         num_pred_o = len(np.unique(pred_mask_o[pred_mask_o > 0]))
                         
-                        # Bottom-Left: Organelle GT
-                        axes[1, 0].imshow(img_disp_o)
+                        axes[1, 0].imshow(img_disp_o, cmap='gray')
                         if np.any(gt_mask_o > 0):
-                            axes[1, 0].contour(gt_mask_o, levels=np.unique(gt_mask_o), colors='lime', linewidths=1.0)
+                            overlay_gt_o = ma.masked_where(gt_mask_o == 0, gt_mask_o)
+                            axes[1, 0].imshow(overlay_gt_o, cmap='prism', alpha=0.4, interpolation='none')
                         axes[1, 0].set_title(f"Epoch {iepoch} | Organelles - Actual GT (n={num_gt_o})", fontsize=14, fontweight='bold')
                         axes[1, 0].axis('off')
                         
-                        # Bottom-Right: Organelle Prediction
-                        axes[1, 1].imshow(img_disp_o)
+                        axes[1, 1].imshow(img_disp_o, cmap='gray')
                         if np.any(pred_mask_o > 0):
-                            axes[1, 1].contour(pred_mask_o, levels=np.unique(pred_mask_o), colors='red', linewidths=1.0)
+                            overlay_pred_o = ma.masked_where(pred_mask_o == 0, pred_mask_o)
+                            axes[1, 1].imshow(overlay_pred_o, cmap='prism', alpha=0.4, interpolation='none')
                         axes[1, 1].set_title(f"Epoch {iepoch} | Organelles - Predicted (n={num_pred_o})", fontsize=14, fontweight='bold')
                         axes[1, 1].axis('off')
 
@@ -804,12 +712,11 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 except Exception as e:
                     train_logger.warning(f"Failed to generate full evaluation visualization: {e}")
                     
-            # 6. Safety Cleanup - Free up GPU memory so the training loop can continue safely
             del eval_model
             torch.cuda.empty_cache()
 
         if iepoch == n_epochs - 1 or (iepoch % save_every == 0 and iepoch != 0):
-            if save_each and iepoch != n_epochs - 1:  #separate files as model progresses
+            if save_each and iepoch != n_epochs - 1:
                 filename0 = str(filename) + f"_epoch_{iepoch:04d}"
             else:
                 filename0 = filename
@@ -822,7 +729,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         train_logger.info(f">>> converting network back to {original_net_dtype} after training")
         net.dtype = original_net_dtype
 
-    # --- Hugging Face Upload Logic ---
     if hf_repo_id and hf_token:
         train_logger.info(f">>> Uploading model to Hugging Face Hub: {hf_repo_id}")
         try:
