@@ -100,10 +100,12 @@ class CellposeModel():
         pretrained_model (str): Path to pretrained cellpose model.
         pretrained_model_ortho (str): Path or model_name for pretrained cellpose model for ortho views in 3D.
         backbone (str): Type of network ("default" is the standard res-unet, "transformer" for the segformer).
+        freeze_backbone (bool): Whether the ViT backbone is frozen for head-only fine-tuning.
     """
 
     def __init__(self, gpu=False, pretrained_model="cpsam", custom_weights=None, model_type=None,
-                 diam_mean=None, device=None, nchan=None, use_bfloat16=True, manual=True):
+                 diam_mean=None, device=None, nchan=None, use_bfloat16=True, manual=True, 
+                 freeze_backbone=False):
 
         if diam_mean is not None:
             models_logger.warning("diam_mean argument are not used in v4.0.1+. Ignoring this argument...")
@@ -139,6 +141,7 @@ class CellposeModel():
         self.pretrained_model = pretrained_model
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
         self.net = Transformer(dtype=dtype).to(self.device)
+        self.freeze_backbone = freeze_backbone
 
         # --- ARCHITECTURE INJECTION ---
         if not manual or custom_weights is not None:
@@ -186,7 +189,28 @@ class CellposeModel():
                     raise FileNotFoundError('model file not recognized')
                 cache_CPSAM_model_path()
                 self.net.load_model(self.pretrained_model, device=self.device)
+                
+        # --- APPLY FREEZE SETTING ---
+        self.set_freeze_backbone(self.freeze_backbone)
         
+
+    def set_freeze_backbone(self, freeze=True):
+        """
+        Dynamically freezes or unfreezes the ViT backbone.
+        The dual-heads (net.out) will ALWAYS remain unfrozen.
+        """
+        self.freeze_backbone = freeze
+        if freeze:
+            models_logger.info("\n>>> [MODELS] FREEZING BACKBONE: Only the Dual Heads will be trained.")
+        else:
+            models_logger.info("\n>>> [MODELS] UNFREEZING BACKBONE: The entire network will be trained (End-to-End).")
+            
+        for name, param in self.net.named_parameters():
+            if 'out' in name:
+                param.requires_grad = True  # Heads ALWAYS train
+            else:
+                param.requires_grad = not freeze # Backbone toggles
+
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,
