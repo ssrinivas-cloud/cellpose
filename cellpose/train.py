@@ -440,19 +440,19 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         train_logger.info(f"[DEBUG] Model Output -> y_cell Shape: {y_cell_dbg.shape}, y_org Shape: {y_org_dbg.shape}")
                         
                         task_type = "Organelles" if batch_tasks[0] == 1 else "Cells"
-                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > -2.0).detach().cpu().numpy())[1]
-                        pred_org_blobs = scipy.ndimage.label((y_org_dbg[0, -1] > -2.0).detach().cpu().numpy())[1]
+                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > 0.0).detach().cpu().numpy())[1]
+                        pred_org_blobs = scipy.ndimage.label((y_org_dbg[0, -1] > 0.0).detach().cpu().numpy())[1]
                         
                         train_logger.info(f"[DEBUG] Image 0 Task Assignment: {task_type}")
                         train_logger.info(f"[DEBUG] Image 0 ACTUAL Ground Truth Masks: {actual_masks}")
-                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Cell Masks (Logit > -2.0): {pred_cell_blobs}")
-                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Org Masks (Logit > -2.0): {pred_org_blobs}")
+                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Cell Masks (Logit > 0.0): {pred_cell_blobs}")
+                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Org Masks (Logit > 0.0): {pred_org_blobs}")
                     else:
                         y_cell_dbg = outputs
-                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > -2.0).detach().cpu().numpy())[1]
+                        pred_cell_blobs = scipy.ndimage.label((y_cell_dbg[0, -1] > 0.0).detach().cpu().numpy())[1]
                         train_logger.info(f"[DEBUG] Model Output -> y_cell Shape: {y_cell_dbg.shape}")
                         train_logger.info(f"[DEBUG] Image 0 ACTUAL Ground Truth Masks: {actual_masks}")
-                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Masks (Logit > -2.0): {pred_cell_blobs}")
+                        train_logger.info(f"[DEBUG] Image 0 PREDICTED Masks (Logit > 0.0): {pred_cell_blobs}")
                         
                     train_logger.info(f"[DEBUG] ---------------------------\n")
                 # ==========================================
@@ -601,7 +601,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 test_data, 
                 batch_size=2, 
                 channels=[0,0], 
-                cellprob_threshold=-2.0, 
+                cellprob_threshold=0.0, 
                 rescale=1.0,               
                 active_head='both'         
             )
