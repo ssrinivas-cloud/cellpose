@@ -177,7 +177,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
             with torch.autocast(device_type=device.type, dtype=net.dtype):
                 # Predict BOTH simultaneously
-                y_cell, y_org = net(X)
+                outputs, style = net(X) # <-- BUG FIXED HERE
+                y_cell, y_org = outputs
                 
                 # ==========================================
                 # DEBUG LOGGER
@@ -252,7 +253,9 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         L_o = torch.from_numpy(lbl_o_aug).to(device)
 
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
-                            y_cell, y_org = net(X)
+                            outputs, style = net(X) # <-- BUG FIXED HERE
+                            y_cell, y_org = outputs
+                            
                             loss_c = _loss_fn_seg(L_c, y_cell, device)
                             loss_o = _loss_fn_seg(L_o, y_org, device)
                             loss = loss_c + loss_o
