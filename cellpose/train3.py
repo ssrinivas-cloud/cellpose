@@ -94,7 +94,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, auto_unfreeze=False, 
-              turnoff_cell_loss=False, **kwargs):  # <--- Added flag here
+              turnoff_cell_loss=False, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -181,11 +181,50 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 outputs, style = net(X) 
                 y_cell, y_org = outputs
                 
+                # ==========================================================
+                # TRAINING PIPELINE DEBUG VISUALIZATION
+                # ==========================================================
                 if debug and k == 0:
+                    y_c_np = (y_cell[0, -1] > 0.0).detach().cpu().numpy()
+                    y_o_np = (y_org[0, -1] > 0.0).detach().cpu().numpy()
+                    pred_cell_blobs = scipy.ndimage.label(y_c_np)[1]
+                    pred_org_blobs = scipy.ndimage.label(y_o_np)[1]
+                    
                     train_logger.info(f"\n[DEBUG] --- EPOCH {iepoch} BATCH 0 ---")
-                    pred_cell_blobs = scipy.ndimage.label((y_cell[0, -1] > 0.0).detach().cpu().numpy())[1]
-                    pred_org_blobs = scipy.ndimage.label((y_org[0, -1] > 0.0).detach().cpu().numpy())[1]
                     train_logger.info(f"[DEBUG] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
+
+                    try:
+                        import matplotlib.pyplot as plt
+                        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+                        
+                        # Extract the exact crop sent to network (B, C, H, W)
+                        img_c = imgi[0, 0] # Channel 1 (Cells)
+                        img_o = imgi[0, 3] # Channel 4 (Organelles)
+                        
+                        # Extract GT masks (Index 0 of labels is the flow mask)
+                        gt_c = lbl_c_aug[0, 0] > 0
+                        gt_o = lbl_o_aug[0, 0] > 0
+                        
+                        # Plot Cells
+                        axes[0].imshow(img_c, cmap='gray')
+                        if np.any(gt_c): axes[0].contour(gt_c, colors='lime', linewidths=1.0)
+                        if np.any(y_c_np): axes[0].contour(y_c_np, colors='red', linewidths=1.0, linestyles='dashed')
+                        axes[0].set_title(f"Cells (GT: Lime, Pred: Red)")
+                        axes[0].axis('off')
+                        
+                        # Plot Organelles
+                        axes[1].imshow(img_o, cmap='gray')
+                        if np.any(gt_o): axes[1].contour(gt_o, colors='lime', linewidths=1.0)
+                        if np.any(y_o_np): axes[1].contour(y_o_np, colors='red', linewidths=1.0, linestyles='dashed')
+                        axes[1].set_title(f"Organelles (GT: Lime, Pred: Red)")
+                        axes[1].axis('off')
+                        
+                        plt.tight_layout()
+                        plt.savefig(save_path / f"debug_training_crop_epoch_{iepoch:04d}.png")
+                        plt.close(fig)
+                    except Exception as e:
+                        train_logger.warning(f"Debug plotting failed: {e}")
+                # ==========================================================
 
                 loss_org = _loss_fn_org(L_o, y_org, device) 
                 
@@ -246,7 +285,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                             
                             loss_o = _loss_fn_org(L_o, y_org, device) 
                             
-                            # ---> DYNAMIC LOSS TOGGLE <---
                             if not turnoff_cell_loss:
                                 loss_c = _loss_fn_seg(L_c, y_cell, device)
                                 loss = loss_c + loss_o
@@ -287,7 +325,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     fig, axes = plt.subplots(2, 2, figsize=(14, 14))
                     img_disp = test_data[0].copy()
                     
-                    # Safe transposition for 2, 3, or 6 channel arrays
                     if img_disp.ndim == 3 and img_disp.shape[0] in [2, 3, 6]:
                         img_disp = img_disp.transpose(1, 2, 0)
                     if img_disp.max() > 1.0: 
