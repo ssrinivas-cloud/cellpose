@@ -75,7 +75,7 @@ class DualPathTransformer(nn.Module):
         super().__init__()
         self.base_net = base_net
         
-        # --- BUG FIX: Forward Cellpose attributes to the wrapper ---
+        # Forward Cellpose attributes to the wrapper
         self.diam_mean = getattr(base_net, 'diam_mean', nn.Parameter(torch.tensor([30.0])))
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0])))
         
@@ -103,7 +103,6 @@ class DualPathTransformer(nn.Module):
         
         self.active_head = 'both'
 
-    # --- BUG FIX: Dynamically pass PyTorch device and dtype ---
     @property
     def device(self):
         return next(self.parameters()).device
@@ -111,6 +110,11 @@ class DualPathTransformer(nn.Module):
     @property
     def dtype(self):
         return next(self.parameters()).dtype
+
+    # ---> NEW FIX: Add a setter so train.py can actually change the dtype!
+    @dtype.setter
+    def dtype(self, new_dtype):
+        self.to(new_dtype)
 
     def load_model(self, path, device):
         """ Safe hook for train.py to load the weights """
