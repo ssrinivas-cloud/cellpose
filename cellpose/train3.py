@@ -93,7 +93,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               batch_size=8, learning_rate=3e-4, n_epochs=100, weight_decay=0.0001, 
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
-              save_flows=False, visualize=False, debug=False, auto_unfreeze=False, **kwargs):
+              save_flows=False, visualize=False, debug=False, auto_unfreeze=False, 
+              turnoff_cell_loss=False, **kwargs):  # <--- Added flag here
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -116,6 +117,9 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
+    
+    if turnoff_cell_loss:
+        train_logger.info(">>> [ABLATION MODE] Cell Loss is turned OFF. Training Organelles only.")
 
     is_frozen = False
     if auto_unfreeze:
@@ -183,9 +187,14 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     pred_org_blobs = scipy.ndimage.label((y_org[0, -1] > 0.0).detach().cpu().numpy())[1]
                     train_logger.info(f"[DEBUG] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
 
-                loss_cell = _loss_fn_seg(L_c, y_cell, device)
                 loss_org = _loss_fn_org(L_o, y_org, device) 
-                loss = (loss_cell + loss_org) / accumulation_steps
+                
+                # ---> DYNAMIC LOSS TOGGLE <---
+                if not turnoff_cell_loss:
+                    loss_cell = _loss_fn_seg(L_c, y_cell, device)
+                    loss = (loss_cell + loss_org) / accumulation_steps
+                else:
+                    loss = loss_org / accumulation_steps
 
             scaler.scale(loss).backward()
             
@@ -235,9 +244,14 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                             outputs, style = net(X) 
                             y_cell, y_org = outputs
                             
-                            loss_c = _loss_fn_seg(L_c, y_cell, device)
                             loss_o = _loss_fn_org(L_o, y_org, device) 
-                            loss = loss_c + loss_o
+                            
+                            # ---> DYNAMIC LOSS TOGGLE <---
+                            if not turnoff_cell_loss:
+                                loss_c = _loss_fn_seg(L_c, y_cell, device)
+                                loss = loss_c + loss_o
+                            else:
+                                loss = loss_o
                         
                         lavgt += loss.item() * len(imgi)
                 lavgt /= nimg_test
