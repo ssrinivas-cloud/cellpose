@@ -29,7 +29,6 @@ def _loss_fn_seg(lbl, y, device):
 
 # --- STANDARD ORGANELLE LOSS ---
 def _loss_fn_org(lbl, y, device):
-    # Restored to standard Cellpose loss matching the successful standalone run
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
     veci = 5. * lbl[:, -2:]
@@ -42,8 +41,23 @@ def _get_batch(inds, data=None, labels_c=None, labels_o=None):
     imgs = []
     for i in inds:
         img = data[i].copy()
-        if img.ndim == 3 and img.shape[-1] == 3:
+        
+        # Standardize to (C, H, W)
+        if img.ndim == 3 and img.shape[-1] <= 3:
             img = img.transpose(2, 0, 1)
+            
+        # Detect and drop fake zero-padded 3rd channel if it was added upstream
+        if img.ndim == 3 and img.shape[0] == 3:
+            if np.max(img[2]) == 0.0 and np.min(img[2]) == 0.0:
+                img = img[:2]
+                
+        # ---> MAGIC TRICK: Duplicate C1x3 and C2x3 to build the true 6-channel stack <---
+        if img.ndim == 3 and img.shape[0] == 2:
+            img = np.concatenate([
+                np.repeat(img[0:1], 3, axis=0),
+                np.repeat(img[1:2], 3, axis=0)
+            ], axis=0)
+            
         img = normalize_img(img, axis=0) 
         imgs.append(img)
         
@@ -103,9 +117,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
 
-    # =======================================================
-    # FIXED FREEZING PROTOCOL
-    # =======================================================
     is_frozen = False
     if auto_unfreeze:
         is_frozen = True
@@ -192,9 +203,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
         train_losses[iepoch] /= nimg
 
-        # =======================================================
-        # SCHEDULED UNFREEZE AT EXACTLY 50%
-        # =======================================================
         if auto_unfreeze and is_frozen and iepoch >= (n_epochs // 2):
             train_logger.info(f"\n>>> [AUTO-UNFREEZE] 50% Milestone Reached ({iepoch}/{n_epochs}). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
             for param in net.parameters(): 
@@ -263,15 +271,19 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 try:
                     import matplotlib.pyplot as plt
                     fig, axes = plt.subplots(2, 2, figsize=(14, 14))
-                    img_disp = test_data[0][..., :3].copy()
-                    if img_disp.shape[0] == 3: img_disp = img_disp.transpose(1, 2, 0)
-                    if img_disp.max() > 1.0: img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
+                    img_disp = test_data[0].copy()
+                    
+                    # Safe transposition for 2, 3, or 6 channel arrays
+                    if img_disp.ndim == 3 and img_disp.shape[0] in [2, 3, 6]:
+                        img_disp = img_disp.transpose(1, 2, 0)
+                    if img_disp.max() > 1.0: 
+                        img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
                     
                     img_cell = img_disp[..., 0] 
                     axes[0, 0].imshow(img_cell, cmap='gray'); axes[0, 0].contour(gt_cells[0]>0, colors='lime', linewidths=0.5); axes[0, 0].set_title("Cells - Actual GT")
                     axes[0, 1].imshow(img_cell, cmap='gray'); axes[0, 1].contour(pred_cells[0]>0, colors='red', linewidths=0.5); axes[0, 1].set_title("Cells - Predicted")
                     
-                    img_org = img_disp[..., 1]
+                    img_org = img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0]
                     axes[1, 0].imshow(img_org, cmap='gray'); axes[1, 0].contour(gt_orgs[0]>0, colors='lime', linewidths=0.5); axes[1, 0].set_title("Organelles - Actual GT")
                     axes[1, 1].imshow(img_org, cmap='gray'); axes[1, 1].contour(pred_orgs[0]>0, colors='red', linewidths=0.5); axes[1, 1].set_title("Organelles - Predicted")
                     
