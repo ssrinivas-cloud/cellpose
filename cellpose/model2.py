@@ -67,40 +67,23 @@ def get_user_models():
 
 
 class DualPathTransformer(nn.Module):
-    """
-    Wraps the ViT backbone to safely split the architecture at the Neck.
-    Handles the PixelShuffle reshape natively.
-    """
     def __init__(self, base_net):
         super().__init__()
         self.base_net = base_net
         
-        # Forward Cellpose attributes to the wrapper
         self.diam_mean = getattr(base_net, 'diam_mean', nn.Parameter(torch.tensor([30.0])))
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0])))
         
-        # Deep clone the Neck and Head for Cells
+        # Deep clone the Neck and Head for Cells (Keeps Pretrained Weights)
         self.cell_neck = copy.deepcopy(base_net.encoder.neck)
         self.cell_out = copy.deepcopy(base_net.out)
         
-        # Deep clone the Neck and Head for Organelles
+        # Deep clone the Neck and Head for Organelles (KEEPS PRETRAINED WEIGHTS NOW!)
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
         self.org_out = copy.deepcopy(base_net.out)
         
-        # BREAK THE SYMMETRY: Scramble Organelle weights so it learns independently
-        for m in self.org_neck.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None: nn.init.constant_(m.bias, 0)
-        for m in self.org_out.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None: nn.init.constant_(m.bias, 0)
-        
-        # Disconnect original neck and out to prevent double-processing
         self.base_net.encoder.neck = nn.Identity()
         self.base_net.out = nn.Identity()
-        
         self.active_head = 'both'
 
     @property
