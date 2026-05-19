@@ -71,7 +71,7 @@ class DualPathTransformer(nn.Module):
     Wraps the ViT backbone to safely split the architecture at the Neck.
     Handles the PixelShuffle reshape natively.
     """
-    def __init__(self, base_net):
+    def __init__(self, base_net, randomize_org=False):
         super().__init__()
         self.base_net = base_net
         
@@ -86,19 +86,21 @@ class DualPathTransformer(nn.Module):
         self.cell_neck = copy.deepcopy(base_net.encoder.neck)
         self.cell_out = copy.deepcopy(base_net.out)
         
-        # Deep clone the Neck and Head for Organelles (KEEPS PRETRAINED WEIGHTS NOW!)
+        # Deep clone the Neck and Head for Organelles 
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
         self.org_out = copy.deepcopy(base_net.out)
         
-        # BREAK THE SYMMETRY: Scramble Organelle weights so it learns independently
-        for m in self.org_neck.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None: nn.init.constant_(m.bias, 0)
-        for m in self.org_out.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None: nn.init.constant_(m.bias, 0)
+        # ---> OPTIONAL SYMMETRY BREAKING (Ablation toggle) <---
+        if randomize_org:
+            models_logger.info(">>> [ABLATION] Randomizing Organelle Head Weights (Kaiming Normal)...")
+            for m in self.org_neck.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight)
+                    if m.bias is not None: nn.init.constant_(m.bias, 0)
+            for m in self.org_out.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight)
+                    if m.bias is not None: nn.init.constant_(m.bias, 0)
         
         # Disconnect original neck and out to prevent double-processing
         self.base_net.encoder.neck = nn.Identity()
@@ -189,7 +191,7 @@ class CellposeModel():
 
     def __init__(self, gpu=False, pretrained_model="cpsam", custom_weights=None, model_type=None,
                  diam_mean=None, device=None, nchan=None, use_bfloat16=True, manual=True, 
-                 freeze_backbone=False):
+                 freeze_backbone=False, random=False):
 
         if diam_mean is not None:
             models_logger.warning("diam_mean argument are not used in v4.0.1+. Ignoring this argument...")
@@ -278,7 +280,7 @@ class CellposeModel():
         # 4. Wrap in DualPath Architecture
         if not manual or custom_weights is not None:
             models_logger.info("Injecting DualPathTransformer (Branching directly from SAM Neck)...")
-            self.net = DualPathTransformer(base_net).to(self.device)
+            self.net = DualPathTransformer(base_net, randomize_org=random).to(self.device)
         else:
             self.net = base_net
 
