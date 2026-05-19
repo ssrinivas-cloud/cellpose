@@ -67,10 +67,15 @@ def get_user_models():
 
 
 class DualPathTransformer(nn.Module):
+    """
+    Wraps the ViT backbone to safely split the architecture at the Neck.
+    Handles the PixelShuffle reshape natively.
+    """
     def __init__(self, base_net):
         super().__init__()
         self.base_net = base_net
         
+        # Forward Cellpose attributes to the wrapper
         self.diam_mean = getattr(base_net, 'diam_mean', nn.Parameter(torch.tensor([30.0])))
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0])))
         
@@ -82,8 +87,10 @@ class DualPathTransformer(nn.Module):
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
         self.org_out = copy.deepcopy(base_net.out)
         
+        # Disconnect original neck and out to prevent double-processing
         self.base_net.encoder.neck = nn.Identity()
         self.base_net.out = nn.Identity()
+        
         self.active_head = 'both'
 
     @property
@@ -115,7 +122,7 @@ class DualPathTransformer(nn.Module):
         return x.view(B, out_c, H * 8, W * 8)
 
     def forward(self, x):
-        # 1. Get raw ViT features [B, 1024, 32, 32]
+        # 1. Get raw ViT features
         feat = self.base_net.encoder(x) 
         
         if self.active_head == 'cells':
@@ -170,8 +177,10 @@ class CellposeModel():
             models_logger.warning("diam_mean argument are not used in v4.0.1+. Ignoring this argument...")
         if model_type is not None:
             models_logger.warning("model_type argument is not used in v4.0.1+. Ignoring this argument...")
-        if nchan is not None:
-            models_logger.warning("nchan argument is deprecated in v4.0.1+. Ignoring this argument")
+        
+        # Default to 6 channels for the multi-channel stack
+        if nchan is None:
+            nchan = 6
 
         ### assign model device
         self.device = assign_device(gpu=gpu)[0] if device is None else device
@@ -200,10 +209,10 @@ class CellposeModel():
         self.pretrained_model = pretrained_model
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
         
-        # 1. Initialize Base Network
+        # 1. Initialize Base Network (3 channels)
         base_net = Transformer(dtype=dtype).to(self.device)
 
-        # 2. Load Pretrained CPSAM backbone FIRST so we can clone its weights
+        # 2. Load Pretrained CPSAM backbone FIRST so we can clone its 3-channel weights
         if not (custom_weights is not None and os.path.exists(custom_weights)):
             if os.path.exists(self.pretrained_model):
                 models_logger.info(f">>>> loading base model {self.pretrained_model}")
@@ -214,7 +223,38 @@ class CellposeModel():
                 cache_CPSAM_model_path()
                 base_net.load_model(self.pretrained_model, device=self.device)
 
-        # 3. Wrap in DualPath Architecture
+        # =================================================================
+        # 3. DYNAMIC INPUT CHANNEL MODIFICATION (e.g. 3 -> 6)
+        # =================================================================
+        if nchan != 3:
+            models_logger.info(f"Modifying input patch_embed from 3 to {nchan} channels...")
+            patch_embed = base_net.encoder.patch_embed
+            for name, layer in patch_embed.named_children():
+                if isinstance(layer, nn.Conv2d):
+                    new_conv = nn.Conv2d(
+                        in_channels=nchan,
+                        out_channels=layer.out_channels,
+                        kernel_size=layer.kernel_size,
+                        stride=layer.stride,
+                        padding=layer.padding,
+                        bias=(layer.bias is not None)
+                    )
+                    with torch.no_grad():
+                        # Copy the original pretrained weights for the first 3 channels
+                        new_conv.weight[:, :3, :, :] = layer.weight.clone()
+                        
+                        # Zero-initialize the new stacked channels
+                        nn.init.zeros_(new_conv.weight[:, 3:, :, :])
+                        
+                        if layer.bias is not None:
+                            new_conv.bias.copy_(layer.bias)
+                            
+                    setattr(patch_embed, name, new_conv)
+                    getattr(patch_embed, name).to(dtype=dtype, device=self.device)
+                    models_logger.info("Input channel modification complete!")
+                    break
+
+        # 4. Wrap in DualPath Architecture
         if not manual or custom_weights is not None:
             models_logger.info("Injecting DualPathTransformer (Branching directly from SAM Neck)...")
             self.net = DualPathTransformer(base_net).to(self.device)
@@ -223,7 +263,8 @@ class CellposeModel():
 
         self.freeze_backbone = freeze_backbone
 
-        # 4. If resuming training from Custom Weights, load them NOW
+        # 5. If resuming training from Custom Weights, load them NOW
+        # (This will load perfectly because self.net already expects nchan channels!)
         if custom_weights is not None and os.path.exists(custom_weights):
             models_logger.info(f">>>> loading CUSTOM post-architectural weights {custom_weights}")
             self.net.load_model(custom_weights, device=self.device)
