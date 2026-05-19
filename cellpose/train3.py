@@ -152,6 +152,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
+    best_loss, patience_counter, plateau_patience = float('inf'), 0, 5
     
     for iepoch in range(n_epochs):
         rperm = np.random.permutation(nimg)
@@ -190,42 +191,40 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     pred_org_blobs = scipy.ndimage.label(y_o_np)[1]
                     
                     train_logger.info(f"\n[DEBUG] --- EPOCH {iepoch} BATCH 0 ---")
-                    train_logger.info(f"[DEBUG] Batch 0 Crop Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
+                    train_logger.info(f"[DEBUG] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
 
-                    if visualize:
-                        try:
-                            import matplotlib.pyplot as plt
-                            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-                            
-                            # Extract the exact crop sent to network (B, C, H, W)
-                            img_c = imgi[0, 0] # Channel 1 (Cells)
-                            img_o = imgi[0, 3] # Channel 4 (Organelles)
-                            
-                            # Extract GT masks
-                            gt_c = lbl_c_aug[0, 0] > 0
-                            gt_o = lbl_o_aug[0, 0] > 0
-                            
-                            axes[0].imshow(img_c, cmap='gray')
-                            if np.any(gt_c): axes[0].contour(gt_c, colors='lime', linewidths=1.0)
-                            if np.any(y_c_np): axes[0].contour(y_c_np, colors='red', linewidths=1.0, linestyles='dashed')
-                            axes[0].set_title("Cells Crop (GT: Lime, Pred: Red)")
-                            axes[0].axis('off')
-                            
-                            axes[1].imshow(img_o, cmap='gray')
-                            if np.any(gt_o): axes[1].contour(gt_o, colors='lime', linewidths=1.0)
-                            if np.any(y_o_np): axes[1].contour(y_o_np, colors='red', linewidths=1.0, linestyles='dashed')
-                            axes[1].set_title("Organelles Crop (GT: Lime, Pred: Red)")
-                            axes[1].axis('off')
-                            
-                            plt.tight_layout()
-                            plt.savefig(save_path / f"debug_training_crop_epoch_{iepoch:04d}.png")
-                            plt.close(fig)
-                        except Exception as e:
-                            train_logger.warning(f"Debug plotting failed: {e}")
+                    try:
+                        import matplotlib.pyplot as plt
+                        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+                        
+                        img_c = imgi[0, 0]
+                        img_o = imgi[0, 3] 
+                        
+                        gt_c = lbl_c_aug[0, 0] > 0
+                        gt_o = lbl_o_aug[0, 0] > 0
+                        
+                        axes[0].imshow(img_c, cmap='gray')
+                        if np.any(gt_c): axes[0].contour(gt_c, colors='lime', linewidths=1.0)
+                        if np.any(y_c_np): axes[0].contour(y_c_np, colors='red', linewidths=1.0, linestyles='dashed')
+                        axes[0].set_title(f"Cells (GT: Lime, Pred: Red)")
+                        axes[0].axis('off')
+                        
+                        axes[1].imshow(img_o, cmap='gray')
+                        if np.any(gt_o): axes[1].contour(gt_o, colors='lime', linewidths=1.0)
+                        if np.any(y_o_np): axes[1].contour(y_o_np, colors='red', linewidths=1.0, linestyles='dashed')
+                        axes[1].set_title(f"Organelles (GT: Lime, Pred: Red)")
+                        axes[1].axis('off')
+                        
+                        plt.tight_layout()
+                        plt.savefig(save_path / f"debug_training_crop_epoch_{iepoch:04d}.png")
+                        plt.close(fig)
+                    except Exception as e:
+                        train_logger.warning(f"Debug plotting failed: {e}")
                 # ==========================================================
 
                 loss_org = _loss_fn_org(L_o, y_org, device) 
                 
+                # ---> DYNAMIC LOSS TOGGLE <---
                 if not turnoff_cell_loss:
                     loss_cell = _loss_fn_seg(L_c, y_cell, device)
                     loss = (loss_cell + loss_org) / accumulation_steps
@@ -256,59 +255,61 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             optimizer = torch.optim.AdamW(net.parameters(), lr=LR[iepoch], weight_decay=weight_decay)
             is_frozen = False
 
-        # --- Standard Test Loss Calculation ---
-        lavgt = 0.
-        if test_data:
-            rperm_test = np.random.permutation(nimg_test)
-            for ibatch in range(0, nimg_test, batch_size):
-                with torch.no_grad():
-                    net.eval()
-                    inds = rperm_test[ibatch:ibatch + batch_size]
-                    imgs, lbls_c, lbls_o = _get_batch(inds, data=test_data, labels_c=test_flows_c, labels_o=test_flows_o)
-                    diams = np.array([diam_test[i] for i in inds])
-                    rsc = diams / net.diam_mean.item() if rescale else np.ones(len(diams), "float32")
-                    
-                    lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
-                    imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
-                    lbl_c_aug, lbl_o_aug = lbl_aug[:, :3, :, :], lbl_aug[:, 3:, :, :]
+        if iepoch == 5 or iepoch % 10 == 0:
+            lavgt = 0.
+            if test_data:
+                rperm_test = np.random.permutation(nimg_test)
+                for ibatch in range(0, nimg_test, batch_size):
+                    with torch.no_grad():
+                        net.eval()
+                        inds = rperm_test[ibatch:ibatch + batch_size]
+                        imgs, lbls_c, lbls_o = _get_batch(inds, data=test_data, labels_c=test_flows_c, labels_o=test_flows_o)
+                        diams = np.array([diam_test[i] for i in inds])
+                        rsc = diams / net.diam_mean.item() if rescale else np.ones(len(diams), "float32")
                         
-                    X = torch.from_numpy(imgi).to(device)
-                    L_c = torch.from_numpy(lbl_c_aug).to(device)
-                    L_o = torch.from_numpy(lbl_o_aug).to(device)
+                        lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
+                        imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
+                        lbl_c_aug, lbl_o_aug = lbl_aug[:, :3, :, :], lbl_aug[:, 3:, :, :]
+                            
+                        X = torch.from_numpy(imgi).to(device)
+                        L_c = torch.from_numpy(lbl_c_aug).to(device)
+                        L_o = torch.from_numpy(lbl_o_aug).to(device)
 
-                    with torch.autocast(device_type=device.type, dtype=net.dtype):
-                        outputs, style = net(X) 
-                        y_cell, y_org = outputs
+                        with torch.autocast(device_type=device.type, dtype=net.dtype):
+                            outputs, style = net(X) 
+                            y_cell, y_org = outputs
+                            
+                            loss_o = _loss_fn_org(L_o, y_org, device) 
+                            
+                            if not turnoff_cell_loss:
+                                loss_c = _loss_fn_seg(L_c, y_cell, device)
+                                loss = loss_c + loss_o
+                            else:
+                                loss = loss_o
                         
-                        loss_o = _loss_fn_org(L_o, y_org, device) 
-                        
-                        if not turnoff_cell_loss:
-                            loss_c = _loss_fn_seg(L_c, y_cell, device)
-                            loss = loss_c + loss_o
-                        else:
-                            loss = loss_o
-                    
-                    lavgt += loss.item() * len(imgi)
-            lavgt /= nimg_test
-            test_losses[iepoch] = lavgt
+                        lavgt += loss.item() * len(imgi)
+                lavgt /= nimg_test
+                test_losses[iepoch] = lavgt
                 
         lavg /= nsum
         train_logger.info(f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s")
         lavg, nsum = 0, 0
 
         # ==========================================================
-        # FULL IMAGE DEBUG EVALUATION & COUNTING (Runs if debug=True)
+        # FULL IMAGE DEBUG EVALUATION (ONLY TRIGGERED IF DEBUG=TRUE)
         # ==========================================================
         if debug and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
-            eval_model = model2.CellposeModel(gpu=True, custom_weights=temp_model_path)
+            
+            # ---> THE CRITICAL FIX: Force use_bfloat16=False so the eval model perfectly mirrors the float32 training weights <---
+            eval_model = model2.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False)
             
             masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
             gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
             
-            # Count precise number of masks
+            # --- COUNT MASK INSTANCES ---
             n_cells_pred = pred_cells[0].max() if np.any(pred_cells[0]) else 0
             n_orgs_pred = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
             n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
@@ -341,26 +342,23 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     img_cell = img_disp[..., 0] 
                     axes[0, 0].imshow(img_cell, cmap='gray'); axes[0, 0].contour(gt_cells[0]>0, colors='lime', linewidths=0.5)
                     axes[0, 0].set_title(f"Cells - Actual GT ({n_cells_gt} masks)")
-                    axes[0, 0].axis('off')
                     
                     axes[0, 1].imshow(img_cell, cmap='gray'); axes[0, 1].contour(pred_cells[0]>0, colors='red', linewidths=0.5)
                     axes[0, 1].set_title(f"Cells - Predicted ({n_cells_pred} masks)")
-                    axes[0, 1].axis('off')
                     
                     img_org = img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0]
                     axes[1, 0].imshow(img_org, cmap='gray'); axes[1, 0].contour(gt_orgs[0]>0, colors='lime', linewidths=0.5)
                     axes[1, 0].set_title(f"Organelles - Actual GT ({n_orgs_gt} masks)")
-                    axes[1, 0].axis('off')
                     
                     axes[1, 1].imshow(img_org, cmap='gray'); axes[1, 1].contour(pred_orgs[0]>0, colors='red', linewidths=0.5)
                     axes[1, 1].set_title(f"Organelles - Predicted ({n_orgs_pred} masks)")
-                    axes[1, 1].axis('off')
                     
                     plt.tight_layout(); plt.savefig(save_path / f"epoch_{iepoch:04d}_eval_vis.png"); plt.close(fig)
                 except: pass
             
             del eval_model
             torch.cuda.empty_cache()
+        # ==========================================================
 
     if original_net_dtype != torch.float32: net.dtype = original_net_dtype
 
