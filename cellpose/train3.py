@@ -27,14 +27,14 @@ def _loss_fn_seg(lbl, y, device):
     loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
     return loss + loss2
 
-# --- NEW: CUSTOM ORGANELLE LOSS ---
+# --- STANDARD ORGANELLE LOSS ---
 def _loss_fn_org(lbl, y, device):
+    # Restored to standard Cellpose loss matching the successful standalone run
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
     veci = 5. * lbl[:, -2:]
     loss = criterion(y[:, -3:-1], veci)
-    # REDUCE FLOW PENALTY BY 20x! Stops gradient cancellation with Cells.
-    loss /= 20. 
+    loss /= 2. 
     loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
     return loss + loss2
 
@@ -104,13 +104,25 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
 
     # =======================================================
-    # ALL UNFROZEN END-TO-END
+    # FIXED FREEZING PROTOCOL
     # =======================================================
-    train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End.")
-    for param in net.parameters():
-        param.requires_grad = True
+    is_frozen = False
+    if auto_unfreeze:
+        is_frozen = True
+        train_logger.info("\n>>> [MODELS] Phase 1: Freezing ViT Backbone. Training Deep Dual Branches Only.")
+        for name, param in net.named_parameters():
+            if any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out']):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        trainable_params = filter(lambda p: p.requires_grad, net.parameters())
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+    else:
+        train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End.")
+        for param in net.parameters(): 
+            param.requires_grad = True
+        optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
         
-    optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
     accumulation_steps = max(1, 8 // batch_size)
 
@@ -181,18 +193,15 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         train_losses[iepoch] /= nimg
 
         # =======================================================
-        # PLATEAU LR DROP (Replaces Unfreeze)
+        # SCHEDULED UNFREEZE AT EXACTLY 50%
         # =======================================================
-        if iepoch >= (n_epochs // 2):
-            if train_losses[iepoch] < best_loss - 1e-4:
-                best_loss, patience_counter = train_losses[iepoch], 0
-            else: patience_counter += 1
-                
-            if patience_counter >= plateau_patience:
-                train_logger.info(f"\n>>> [PLATEAU DETECTED] Dropping Learning Rate by 90%!")
-                LR[iepoch:] *= 0.1 
-                optimizer = torch.optim.AdamW(net.parameters(), lr=LR[iepoch], weight_decay=weight_decay)
-                patience_counter = -100 # Prevent multiple drops in quick succession
+        if auto_unfreeze and is_frozen and iepoch >= (n_epochs // 2):
+            train_logger.info(f"\n>>> [AUTO-UNFREEZE] 50% Milestone Reached ({iepoch}/{n_epochs}). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
+            for param in net.parameters(): 
+                param.requires_grad = True
+            
+            optimizer = torch.optim.AdamW(net.parameters(), lr=LR[iepoch], weight_decay=weight_decay)
+            is_frozen = False
 
         if iepoch == 5 or iepoch % 10 == 0:
             lavgt = 0.
