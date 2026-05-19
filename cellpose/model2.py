@@ -149,19 +149,11 @@ class DualPathTransformer(nn.Module):
             return out_o, style
             
         else:
-            # Cell Path
+            # Fallback - should never trigger during _run_net evaluation loop
             feat_c = self.cell_neck(feat)
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
-            
-            # Organelle Path
-            feat_o = self.org_neck(feat)
-            out_o = self.pixel_shuffle(self.org_out(feat_o))
-            
-            # Global Style Vectors
-            style_c = torch.mean(feat_c, dim=(2, 3))
-            style_o = torch.mean(feat_o, dim=(2, 3))
-            
-            return (out_c, out_o), (style_c, style_o)
+            style = torch.mean(feat_c, dim=(2, 3))
+            return out_c, style
 
 
 class CellposeModel():
@@ -498,39 +490,37 @@ class CellposeModel():
         tic = time.time()
         shape = x.shape
         
-        # Set native active head by pointing directly to the wrapper
-        if hasattr(self.net, 'active_head'):
-            self.net.active_head = active_head
-
-        if do_3D:
-            Lz, Ly, Lx = shape[:-1]
-            if rescale != 1.0 or (anisotropy is not None and anisotropy != 1.0):
-                anisotropy = 1.0 if anisotropy is None else anisotropy
-                if rescale != 1.0:
-                    x = transforms.resize_image(x, Ly=int(Ly*rescale), Lx=int(Lx*rescale))
-                x = transforms.resize_image(x.transpose(1,0,2,3),
-                                        Ly=int(Lz*anisotropy*rescale), 
-                                        Lx=int(Lx*rescale)).transpose(1,0,2,3)
-            yf_raw, styles = run_3D(self.net, x,
-                                batch_size=batch_size, augment=augment,  
-                                tile_overlap=tile_overlap, 
-                                bsize=bsize)
-        else:
-            yf_raw, styles = run_net(self.net, x, bsize=bsize, augment=augment,
-                                batch_size=batch_size,  
-                                tile_overlap=tile_overlap, 
-                                rsz=rescale if rescale !=1.0 else None)
-
-        # Slice dual-head outputs natively since DualPathTransformer returns a tuple
-        yf_dict = {}
-        if active_head == 'both':
-            yf_dict['cells'] = yf_raw[0]
-            yf_dict['organelles'] = yf_raw[1]
-        else:
-            yf_dict[active_head] = yf_raw
-
         outputs = {}
-        for head, yf in yf_dict.items():
+        heads_to_run = ['cells', 'organelles'] if active_head == 'both' else [active_head]
+
+        # ---> THE MAGIC FIX: Loop over the heads so core.run_net is natively executed TWICE <---
+        for head in heads_to_run:
+            if hasattr(self.net, 'active_head'):
+                self.net.active_head = head
+
+            if do_3D:
+                Lz, Ly, Lx = shape[:-1]
+                if rescale != 1.0 or (anisotropy is not None and anisotropy != 1.0):
+                    anisotropy = 1.0 if anisotropy is None else anisotropy
+                    if rescale != 1.0:
+                        x_in = transforms.resize_image(x, Ly=int(Ly*rescale), Lx=int(Lx*rescale))
+                    else:
+                        x_in = x
+                    x_in = transforms.resize_image(x_in.transpose(1,0,2,3),
+                                            Ly=int(Lz*anisotropy*rescale), 
+                                            Lx=int(Lx*rescale)).transpose(1,0,2,3)
+                else:
+                    x_in = x
+                yf, styles = run_3D(self.net, x_in,
+                                    batch_size=batch_size, augment=augment,  
+                                    tile_overlap=tile_overlap, 
+                                    bsize=bsize)
+            else:
+                yf, styles = run_net(self.net, x, bsize=bsize, augment=augment,
+                                    batch_size=batch_size,  
+                                    tile_overlap=tile_overlap, 
+                                    rsz=rescale if rescale !=1.0 else None)
+
             if resample:
                 if do_3D:
                     if rescale != 1.0 or Lz != yf.shape[0]:
@@ -549,13 +539,11 @@ class CellposeModel():
                 cellprob = yf[..., -1]
                 dP = yf[..., -3:-1].transpose((3, 0, 1, 2))
                 
-            # Properly unpack deep styles if they exist
-            if active_head == 'both':
-                curr_style = styles[0] if head == 'cells' else styles[1]
-            else:
-                curr_style = styles
-            
-            outputs[head] = (dP, cellprob, curr_style.squeeze() if isinstance(curr_style, np.ndarray) else curr_style)
+            outputs[head] = (dP, cellprob, styles.squeeze() if isinstance(styles, np.ndarray) else styles)
+
+        # Re-set back to original state to prevent accidental state corruption
+        if hasattr(self.net, 'active_head'):
+            self.net.active_head = active_head
 
         return outputs
     
