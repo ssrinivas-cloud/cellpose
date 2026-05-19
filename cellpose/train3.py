@@ -2,7 +2,6 @@ import time
 import os
 import numpy as np
 import scipy.ndimage
-# ---> UPDATED IMPORT HERE: Swapped 'models' for 'model2'
 from cellpose import io, utils, model2, dynamics
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
@@ -34,7 +33,7 @@ def _loss_fn_org(lbl, y, device):
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
     veci = 5. * lbl[:, -2:]
     loss = criterion(y[:, -3:-1], veci)
-    # REDUCE FLOW PENALTY BY 10x! Stops gradient cancellation with Cells.
+    # REDUCE FLOW PENALTY BY 20x! Stops gradient cancellation with Cells.
     loss /= 20. 
     loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
     return loss + loss2
@@ -104,24 +103,19 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
 
-    is_frozen = False
-    if auto_unfreeze:
-        is_frozen = True
-        train_logger.info("\n>>> [AUTO-UNFREEZE] Enabled! Phase 1: FROZEN BACKBONE.")
-        for name, param in net.named_parameters():
-            if 'decoder' in name: param.requires_grad = True # Updated for DeepDualPathDecoder
-            else: param.requires_grad = False
-        trainable_params = filter(lambda p: p.requires_grad, net.parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    # =======================================================
+    # ALL UNFROZEN END-TO-END
+    # =======================================================
+    train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End.")
+    for param in net.parameters():
+        param.requires_grad = True
         
+    optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
     accumulation_steps = max(1, 8 // batch_size)
 
-    # Note: we don't manually re-initialize weights here anymore because `model2.py` uses `copy.deepcopy`
-    if hasattr(net, 'decoder') and hasattr(net.decoder, 'active_head'):
-        net.decoder.active_head = 'both'
+    if hasattr(net, 'active_head'):
+        net.active_head = 'both'
 
     t0 = time.time()
     model_name = f"cellpose_{t0}" if model_name is None else model_name
@@ -166,9 +160,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     pred_org_blobs = scipy.ndimage.label((y_org[0, -1] > 0.0).detach().cpu().numpy())[1]
                     train_logger.info(f"[DEBUG] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
 
-                # === USE THE NEW ISOLATED LOSSES ===
                 loss_cell = _loss_fn_seg(L_c, y_cell, device)
-                loss_org = _loss_fn_org(L_o, y_org, device) # <-- DE-WEAPONIZED LOSS
+                loss_org = _loss_fn_org(L_o, y_org, device) 
                 loss = (loss_cell + loss_org) / accumulation_steps
 
             scaler.scale(loss).backward()
@@ -187,18 +180,19 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
         train_losses[iepoch] /= nimg
 
-        # Auto-Unfreeze Logic
-        if is_frozen and iepoch >= (n_epochs // 2):
+        # =======================================================
+        # PLATEAU LR DROP (Replaces Unfreeze)
+        # =======================================================
+        if iepoch >= (n_epochs // 2):
             if train_losses[iepoch] < best_loss - 1e-4:
                 best_loss, patience_counter = train_losses[iepoch], 0
             else: patience_counter += 1
                 
             if patience_counter >= plateau_patience:
-                train_logger.info(f"\n>>> [AUTO-UNFREEZE] Plateau detected. UNFREEZING BACKBONE!")
-                for name, param in net.named_parameters(): param.requires_grad = True
+                train_logger.info(f"\n>>> [PLATEAU DETECTED] Dropping Learning Rate by 90%!")
                 LR[iepoch:] *= 0.1 
                 optimizer = torch.optim.AdamW(net.parameters(), lr=LR[iepoch], weight_decay=weight_decay)
-                is_frozen = False
+                patience_counter = -100 # Prevent multiple drops in quick succession
 
         if iepoch == 5 or iepoch % 10 == 0:
             lavgt = 0.
@@ -225,7 +219,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                             y_cell, y_org = outputs
                             
                             loss_c = _loss_fn_seg(L_c, y_cell, device)
-                            loss_o = _loss_fn_org(L_o, y_org, device) # Update here too!
+                            loss_o = _loss_fn_org(L_o, y_org, device) 
                             loss = loss_c + loss_o
                         
                         lavgt += loss.item() * len(imgi)
@@ -240,8 +234,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         if iepoch % 10 == 0 and iepoch > 0 and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
-            
-            # ---> UPDATED CALL HERE: Uses model2 for visualization inference
             eval_model = model2.CellposeModel(gpu=True, custom_weights=temp_model_path)
             
             masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
