@@ -66,42 +66,84 @@ def get_user_models():
     return model_strings
 
 
-class DeepDualPathDecoder(nn.Module):
+class DualPathTransformer(nn.Module):
     """
-    Splits the architecture immediately after the ViT Neck.
-    Provides two entirely separate, deep upsampling decoder paths.
+    Wraps the ViT backbone to safely split the architecture at the Neck.
+    Handles the PixelShuffle reshape natively.
     """
-    def __init__(self, orig_decoder, orig_out):
+    def __init__(self, base_net):
         super().__init__()
-        # Branch 1: Deep path for Cells
-        self.cell_decoder = copy.deepcopy(orig_decoder)
-        self.cell_out = copy.deepcopy(orig_out)
+        self.base_net = base_net
         
-        # Branch 2: Deep path for Organelles
-        self.organelle_decoder = copy.deepcopy(orig_decoder)
-        self.organelle_out = copy.deepcopy(orig_out)
+        # Deep clone the Neck and Head for Cells
+        self.cell_neck = copy.deepcopy(base_net.encoder.neck)
+        self.cell_out = copy.deepcopy(base_net.out)
+        
+        # Deep clone the Neck and Head for Organelles
+        self.org_neck = copy.deepcopy(base_net.encoder.neck)
+        self.org_out = copy.deepcopy(base_net.out)
+        
+        # BREAK THE SYMMETRY: Scramble Organelle weights so it learns independently
+        for m in self.org_neck.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+        for m in self.org_out.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+        
+        # Disconnect original neck and out to prevent double-processing
+        self.base_net.encoder.neck = nn.Identity()
+        self.base_net.out = nn.Identity()
         
         self.active_head = 'both'
 
+    def load_model(self, path, device):
+        """ Safe hook for train.py to load the weights """
+        self.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+
+    def save_model(self, path):
+        """ Safe hook for train.py to save the weights """
+        torch.save(self.state_dict(), path)
+
+    def pixel_shuffle(self, x):
+        """ Recreates Cellpose's hidden 8x upsampling reshape (192 -> 3 channels) """
+        B, C, H, W = x.shape
+        out_c = C // 64 
+        x = x.view(B, out_c, 8, 8, H, W)
+        x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
+        return x.view(B, out_c, H * 8, W * 8)
+
     def forward(self, x):
+        # 1. Get raw ViT features [B, 1024, 32, 32]
+        feat = self.base_net.encoder(x) 
+        
         if self.active_head == 'cells':
-            feat, style = self.cell_decoder(x)
-            return self.cell_out(feat), style
+            feat_c = self.cell_neck(feat)
+            out_c = self.pixel_shuffle(self.cell_out(feat_c))
+            style = torch.mean(feat_c, dim=(2, 3))
+            return out_c, style
             
         elif self.active_head == 'organelles':
-            feat, style = self.organelle_decoder(x)
-            return self.organelle_out(feat), style
+            feat_o = self.org_neck(feat)
+            out_o = self.pixel_shuffle(self.org_out(feat_o))
+            style = torch.mean(feat_o, dim=(2, 3))
+            return out_o, style
             
         else:
-            # 1. Process deep cell path
-            feat_c, style_c = self.cell_decoder(x)
-            out_c = self.cell_out(feat_c)
+            # Cell Path
+            feat_c = self.cell_neck(feat)
+            out_c = self.pixel_shuffle(self.cell_out(feat_c))
             
-            # 2. Process deep organelle path
-            feat_o, style_o = self.organelle_decoder(x)
-            out_o = self.organelle_out(feat_o)
+            # Organelle Path
+            feat_o = self.org_neck(feat)
+            out_o = self.pixel_shuffle(self.org_out(feat_o))
             
-            # Natively return pure tuples for simultaneous multi-tasking
+            # Global Style Vectors
+            style_c = torch.mean(feat_c, dim=(2, 3))
+            style_o = torch.mean(feat_o, dim=(2, 3))
+            
             return (out_c, out_o), (style_c, style_o)
 
 
@@ -146,7 +188,7 @@ class CellposeModel():
         if pretrained_model is None and custom_weights is None:
             raise ValueError("Must specify a pretrained model, training from scratch is not implemented")
         
-        ### create neural network
+        ### check for pretrained model
         if pretrained_model and not os.path.exists(pretrained_model):
             model_strings = get_user_models()
             all_models = MODEL_NAMES.copy()
@@ -159,45 +201,35 @@ class CellposeModel():
 
         self.pretrained_model = pretrained_model
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
-        self.net = Transformer(dtype=dtype).to(self.device)
-        self.freeze_backbone = freeze_backbone
+        
+        # 1. Initialize Base Network
+        base_net = Transformer(dtype=dtype).to(self.device)
 
-        # --- ARCHITECTURE INJECTION ---
-        if not manual or custom_weights is not None:
-            models_logger.info("Injecting DeepDualPathDecoder (Branching directly from Neck)...")
-            
-            if not manual:
-                for name, param in self.net.named_parameters():
-                    param.requires_grad = True
-            
-            # 1. Grab the original pre-trained upsampling decoder and 1x1 out convolution
-            original_decoder = self.net.decoder 
-            original_out = self.net.out
-            
-            # 2. Build the deep branching paths (deepcopy automatically clones the weights!)
-            deep_dual_head = DeepDualPathDecoder(original_decoder, original_out).to(device=self.device)
-            models_logger.info(">>> Pre-trained decoder and head weights successfully duplicated for both branches.")
-
-            # 3. Attach the new deep paths to the network
-            self.net.decoder = deep_dual_head
-            
-            # 4. Nullify the original 'out' layer so it safely passes the new tuples forward without crashing
-            self.net.out = nn.Identity()
-
-        # --- LOAD WEIGHTS ---
-        if custom_weights is not None and os.path.exists(custom_weights):
-            models_logger.info(f">>>> loading CUSTOM post-architectural weights {custom_weights}")
-            self.net.load_model(custom_weights, device=self.device)
-        else:
+        # 2. Load Pretrained CPSAM backbone FIRST so we can clone its weights
+        if not (custom_weights is not None and os.path.exists(custom_weights)):
             if os.path.exists(self.pretrained_model):
-                models_logger.info(f">>>> loading model {self.pretrained_model}")
-                self.net.load_model(self.pretrained_model, device=self.device)
+                models_logger.info(f">>>> loading base model {self.pretrained_model}")
+                base_net.load_model(self.pretrained_model, device=self.device)
             else:
                 if os.path.split(self.pretrained_model)[-1] != 'cpsam':
                     raise FileNotFoundError('model file not recognized')
                 cache_CPSAM_model_path()
-                self.net.load_model(self.pretrained_model, device=self.device)
-                
+                base_net.load_model(self.pretrained_model, device=self.device)
+
+        # 3. Wrap in DualPath Architecture
+        if not manual or custom_weights is not None:
+            models_logger.info("Injecting DualPathTransformer (Branching directly from SAM Neck)...")
+            self.net = DualPathTransformer(base_net).to(self.device)
+        else:
+            self.net = base_net
+
+        self.freeze_backbone = freeze_backbone
+
+        # 4. If resuming training from Custom Weights, load them NOW
+        if custom_weights is not None and os.path.exists(custom_weights):
+            models_logger.info(f">>>> loading CUSTOM post-architectural weights {custom_weights}")
+            self.net.load_model(custom_weights, device=self.device)
+
         # --- APPLY FREEZE SETTING ---
         self.set_freeze_backbone(self.freeze_backbone)
         
@@ -214,7 +246,7 @@ class CellposeModel():
             models_logger.info("\n>>> [MODELS] UNFREEZING BACKBONE: The entire network will be trained (End-to-End).")
             
         for name, param in self.net.named_parameters():
-            if 'decoder' in name:
+            if 'cell_neck' in name or 'cell_out' in name or 'org_neck' in name or 'org_out' in name:
                 param.requires_grad = True  # Deep Upsampling Paths ALWAYS train
             else:
                 param.requires_grad = not freeze # ViT Backbone toggles
@@ -449,9 +481,9 @@ class CellposeModel():
         tic = time.time()
         shape = x.shape
         
-        # Set native active head (Bypassing Identity out and pointing to decoder)
-        if hasattr(self.net, 'decoder') and hasattr(self.net.decoder, 'active_head'):
-            self.net.decoder.active_head = active_head
+        # Set native active head by pointing directly to the wrapper
+        if hasattr(self.net, 'active_head'):
+            self.net.active_head = active_head
 
         if do_3D:
             Lz, Ly, Lx = shape[:-1]
@@ -472,7 +504,7 @@ class CellposeModel():
                                 tile_overlap=tile_overlap, 
                                 rsz=rescale if rescale !=1.0 else None)
 
-        # Slice dual-head outputs natively since DeepDualPathDecoder returns a tuple
+        # Slice dual-head outputs natively since DualPathTransformer returns a tuple
         yf_dict = {}
         if active_head == 'both':
             yf_dict['cells'] = yf_raw[0]
