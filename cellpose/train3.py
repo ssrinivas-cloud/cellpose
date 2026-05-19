@@ -1,3 +1,7 @@
+"""
+Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
+"""
+
 import time
 import os
 import numpy as np
@@ -37,7 +41,7 @@ def _loss_fn_org(lbl, y, device):
     loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
     return loss + loss2
 
-def _get_batch(inds, data=None, labels_c=None, labels_o=None):
+def _get_batch(inds, data=None, labels_c=None, labels_o=None, two_tail=False):
     imgs = []
     for i in inds:
         img = data[i].copy()
@@ -51,12 +55,15 @@ def _get_batch(inds, data=None, labels_c=None, labels_o=None):
             if np.max(img[2]) == 0.0 and np.min(img[2]) == 0.0:
                 img = img[:2]
                 
-        # ---> MAGIC TRICK: Duplicate C1x3 and C2x3 to build the true 6-channel stack <---
+        # ---> DYNAMIC BATCH MAPPING <---
         if img.ndim == 3 and img.shape[0] == 2:
-            img = np.concatenate([
-                np.repeat(img[0:1], 3, axis=0),
-                np.repeat(img[1:2], 3, axis=0)
-            ], axis=0)
+            if two_tail:
+                img = np.concatenate([
+                    np.repeat(img[0:1], 3, axis=0),
+                    np.repeat(img[1:2], 3, axis=0)
+                ], axis=0)
+            else:
+                img = np.concatenate([img[0:1], img[1:2], np.zeros_like(img[0:1])], axis=0)
             
         img = normalize_img(img, axis=0) 
         imgs.append(img)
@@ -94,7 +101,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, auto_unfreeze=False, 
-              turnoff_cell_loss=False, **kwargs):
+              turnoff_cell_loss=False, two_tail=False, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -115,7 +122,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     LR_cosine = min_lr + 0.5 * (learning_rate - min_lr) * (1 + np.cos(np.pi * np.arange(cosine_epochs) / cosine_epochs)) if cosine_epochs > 0 else np.array([])
     LR = np.concatenate([LR_warmup, LR_cosine])
     
-    train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
+    train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}, two_tail={two_tail}")
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
     
     if turnoff_cell_loss:
@@ -165,7 +172,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             kend = min(k + batch_size, nimg)
             inds = rperm[k:kend]
             
-            imgs, lbls_c, lbls_o = _get_batch(inds, data=train_data, labels_c=train_flows_c, labels_o=train_flows_o)
+            imgs, lbls_c, lbls_o = _get_batch(inds, data=train_data, labels_c=train_flows_c, labels_o=train_flows_o, two_tail=two_tail)
             diams = np.array([diam_train[i] for i in inds])
             rsc = diams / net.diam_mean.item() if rescale else np.ones(len(diams), "float32")
             
@@ -197,18 +204,22 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         import matplotlib.pyplot as plt
                         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
                         
-                        img_c = imgi[0, 0]
-                        img_o = imgi[0, 3] 
+                        # Extract the exact crop sent to network (B, C, H, W) based on two_tail
+                        img_c = imgi[0, 0] 
+                        img_o = imgi[0, 3] if two_tail else imgi[0, 1] 
                         
+                        # Extract GT masks (Index 0 of labels is the flow mask)
                         gt_c = lbl_c_aug[0, 0] > 0
                         gt_o = lbl_o_aug[0, 0] > 0
                         
+                        # Plot Cells
                         axes[0].imshow(img_c, cmap='gray')
                         if np.any(gt_c): axes[0].contour(gt_c, colors='lime', linewidths=1.0)
                         if np.any(y_c_np): axes[0].contour(y_c_np, colors='red', linewidths=1.0, linestyles='dashed')
                         axes[0].set_title(f"Cells (GT: Lime, Pred: Red)")
                         axes[0].axis('off')
                         
+                        # Plot Organelles
                         axes[1].imshow(img_o, cmap='gray')
                         if np.any(gt_o): axes[1].contour(gt_o, colors='lime', linewidths=1.0)
                         if np.any(y_o_np): axes[1].contour(y_o_np, colors='red', linewidths=1.0, linestyles='dashed')
@@ -263,7 +274,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     with torch.no_grad():
                         net.eval()
                         inds = rperm_test[ibatch:ibatch + batch_size]
-                        imgs, lbls_c, lbls_o = _get_batch(inds, data=test_data, labels_c=test_flows_c, labels_o=test_flows_o)
+                        imgs, lbls_c, lbls_o = _get_batch(inds, data=test_data, labels_c=test_flows_c, labels_o=test_flows_o, two_tail=two_tail)
                         diams = np.array([diam_test[i] for i in inds])
                         rsc = diams / net.diam_mean.item() if rescale else np.ones(len(diams), "float32")
                         
@@ -303,7 +314,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             net.save_model(temp_model_path)
             
             # ---> THE CRITICAL FIX: Force use_bfloat16=False so the eval model perfectly mirrors the float32 training weights <---
-            eval_model = model2.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False)
+            # ---> DYNAMIC INSTANTIATION: Use 6 channels if two_tail=True, else 3 channels <---
+            eval_model = model2.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
             
             masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
@@ -346,7 +358,9 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     axes[0, 1].imshow(img_cell, cmap='gray'); axes[0, 1].contour(pred_cells[0]>0, colors='red', linewidths=0.5)
                     axes[0, 1].set_title(f"Cells - Predicted ({n_cells_pred} masks)")
                     
-                    img_org = img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0]
+                    # Ensure dynamic channel lookup based on two_tail
+                    img_org = img_disp[..., 3] if two_tail else (img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0])
+                    
                     axes[1, 0].imshow(img_org, cmap='gray'); axes[1, 0].contour(gt_orgs[0]>0, colors='lime', linewidths=0.5)
                     axes[1, 0].set_title(f"Organelles - Actual GT ({n_orgs_gt} masks)")
                     
