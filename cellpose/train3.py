@@ -2,7 +2,8 @@ import time
 import os
 import numpy as np
 import scipy.ndimage
-from cellpose import io, utils, models, dynamics
+# ---> UPDATED IMPORT HERE: Swapped 'models' for 'model2'
+from cellpose import io, utils, model2, dynamics
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
@@ -108,7 +109,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         is_frozen = True
         train_logger.info("\n>>> [AUTO-UNFREEZE] Enabled! Phase 1: FROZEN BACKBONE.")
         for name, param in net.named_parameters():
-            if 'out' in name: param.requires_grad = True
+            if 'decoder' in name: param.requires_grad = True # Updated for DeepDualPathDecoder
             else: param.requires_grad = False
         trainable_params = filter(lambda p: p.requires_grad, net.parameters())
         optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
@@ -118,14 +119,9 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
     accumulation_steps = max(1, 8 // batch_size)
 
-    if hasattr(net, 'out') and hasattr(net.out, 'active_head'):
-        net.out.active_head = 'both'
-        # =======================================================
-        # MAGIC FIX: BREAK THE SYMMETRY! 
-        # Re-initialize the organelle head so it doesn't fight the cell head
-        # =======================================================
-        nn.init.kaiming_normal_(net.out.organelle_head.weight)
-        nn.init.constant_(net.out.organelle_head.bias, 0)
+    # Note: we don't manually re-initialize weights here anymore because `model2.py` uses `copy.deepcopy`
+    if hasattr(net, 'decoder') and hasattr(net.decoder, 'active_head'):
+        net.decoder.active_head = 'both'
 
     t0 = time.time()
     model_name = f"cellpose_{t0}" if model_name is None else model_name
@@ -244,7 +240,9 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         if iepoch % 10 == 0 and iepoch > 0 and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
-            eval_model = models.CellposeModel(gpu=True, custom_weights=temp_model_path)
+            
+            # ---> UPDATED CALL HERE: Uses model2 for visualization inference
+            eval_model = model2.CellposeModel(gpu=True, custom_weights=temp_model_path)
             
             masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
