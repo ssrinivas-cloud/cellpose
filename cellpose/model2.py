@@ -11,7 +11,7 @@ import torch.nn as nn
 from scipy.ndimage import gaussian_filter
 import gc
 import cv2
-import copy # <--- NEW: For cloning deep network paths
+import copy 
 
 import logging
 
@@ -111,7 +111,6 @@ class DualPathTransformer(nn.Module):
     def dtype(self):
         return next(self.parameters()).dtype
 
-    # ---> NEW FIX: Add a setter so train.py can actually change the dtype!
     @dtype.setter
     def dtype(self, new_dtype):
         self.to(new_dtype)
@@ -149,11 +148,18 @@ class DualPathTransformer(nn.Module):
             return out_o, style
             
         else:
-            # Fallback - should never trigger during _run_net evaluation loop
+            # === RESTORED: Both mode for Training Loop ===
+            # Cell Path
             feat_c = self.cell_neck(feat)
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
-            style = torch.mean(feat_c, dim=(2, 3))
-            return out_c, style
+            style_c = torch.mean(feat_c, dim=(2, 3))
+            
+            # Organelle Path
+            feat_o = self.org_neck(feat)
+            out_o = self.pixel_shuffle(self.org_out(feat_o))
+            style_o = torch.mean(feat_o, dim=(2, 3))
+            
+            return (out_c, out_o), (style_c, style_o)
 
 
 class CellposeModel():
