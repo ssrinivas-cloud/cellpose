@@ -75,27 +75,20 @@ class DualPathTransformer(nn.Module):
         super().__init__()
         self.base_net = base_net
         
+        # Capture the true backbone dtype to prevent PyTorch mixed-precision bias crashes
+        self._true_dtype = next(base_net.parameters()).dtype
+        
         # Forward Cellpose attributes to the wrapper
-        self.diam_mean = getattr(base_net, 'diam_mean', nn.Parameter(torch.tensor([30.0])))
-        self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0])))
+        self.diam_mean = getattr(base_net, 'diam_mean', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
+        self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         
         # Deep clone the Neck and Head for Cells (Keeps Pretrained Weights)
         self.cell_neck = copy.deepcopy(base_net.encoder.neck)
         self.cell_out = copy.deepcopy(base_net.out)
         
-        # Deep clone the Neck and Head for Organelles (KEEPS PRETRAINED WEIGHTS NOW!)
+        # Deep clone the Neck and Head for Organelles (KEEPS PRETRAINED WEIGHTS SO IT CAN FIND LYSOSOMES!)
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
         self.org_out = copy.deepcopy(base_net.out)
-        
-        # BREAK THE SYMMETRY: Scramble Organelle weights so it learns independently
-        for m in self.org_neck.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None: nn.init.constant_(m.bias, 0)
-        for m in self.org_out.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None: nn.init.constant_(m.bias, 0)
         
         # Disconnect original neck and out to prevent double-processing
         self.base_net.encoder.neck = nn.Identity()
@@ -109,11 +102,11 @@ class DualPathTransformer(nn.Module):
 
     @property
     def dtype(self):
-        return next(self.parameters()).dtype
+        return self._true_dtype
 
-    # ---> NEW FIX: Add a setter so train.py can actually change the dtype!
     @dtype.setter
     def dtype(self, new_dtype):
+        self._true_dtype = new_dtype
         self.to(new_dtype)
 
     def load_model(self, path, device):
@@ -133,7 +126,10 @@ class DualPathTransformer(nn.Module):
         return x.view(B, out_c, H * 8, W * 8)
 
     def forward(self, x):
-        # 1. Get raw ViT features [B, 1024, 32, 32]
+        # Safety cast to prevent mixed precision errors
+        x = x.to(self._true_dtype)
+        
+        # 1. Get raw ViT features
         feat = self.base_net.encoder(x) 
         
         if self.active_head == 'cells':
@@ -149,7 +145,7 @@ class DualPathTransformer(nn.Module):
             return out_o, style
             
         else:
-            # === RESTORED: Both mode for Training Loop ===
+            # === Both mode for Training Loop ===
             # Cell Path
             feat_c = self.cell_neck(feat)
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
@@ -223,7 +219,7 @@ class CellposeModel():
         # 1. Initialize Base Network (3 channels)
         base_net = Transformer(dtype=dtype).to(self.device)
 
-        # 2. Load Pretrained CPSAM backbone FIRST so we can clone its weights
+        # 2. Load Pretrained CPSAM backbone FIRST so we can clone its 3-channel weights
         if not (custom_weights is not None and os.path.exists(custom_weights)):
             if os.path.exists(self.pretrained_model):
                 models_logger.info(f">>>> loading base model {self.pretrained_model}")
