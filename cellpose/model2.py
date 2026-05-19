@@ -87,6 +87,16 @@ class DualPathTransformer(nn.Module):
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
         self.org_out = copy.deepcopy(base_net.out)
         
+        # BREAK THE SYMMETRY: Scramble Organelle weights so it learns independently
+        for m in self.org_neck.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+        for m in self.org_out.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+        
         # Disconnect original neck and out to prevent double-processing
         self.base_net.encoder.neck = nn.Identity()
         self.base_net.out = nn.Identity()
@@ -101,6 +111,7 @@ class DualPathTransformer(nn.Module):
     def dtype(self):
         return next(self.parameters()).dtype
 
+    # ---> NEW FIX: Add a setter so train.py can actually change the dtype!
     @dtype.setter
     def dtype(self, new_dtype):
         self.to(new_dtype)
@@ -122,7 +133,7 @@ class DualPathTransformer(nn.Module):
         return x.view(B, out_c, H * 8, W * 8)
 
     def forward(self, x):
-        # 1. Get raw ViT features
+        # 1. Get raw ViT features [B, 1024, 32, 32]
         feat = self.base_net.encoder(x) 
         
         if self.active_head == 'cells':
@@ -212,7 +223,7 @@ class CellposeModel():
         # 1. Initialize Base Network (3 channels)
         base_net = Transformer(dtype=dtype).to(self.device)
 
-        # 2. Load Pretrained CPSAM backbone FIRST so we can clone its 3-channel weights
+        # 2. Load Pretrained CPSAM backbone FIRST so we can clone its weights
         if not (custom_weights is not None and os.path.exists(custom_weights)):
             if os.path.exists(self.pretrained_model):
                 models_logger.info(f">>>> loading base model {self.pretrained_model}")
@@ -264,7 +275,6 @@ class CellposeModel():
         self.freeze_backbone = freeze_backbone
 
         # 5. If resuming training from Custom Weights, load them NOW
-        # (This will load perfectly because self.net already expects nchan channels!)
         if custom_weights is not None and os.path.exists(custom_weights):
             models_logger.info(f">>>> loading CUSTOM post-architectural weights {custom_weights}")
             self.net.load_model(custom_weights, device=self.device)
@@ -343,10 +353,24 @@ class CellposeModel():
         ############# actual eval code ############
         raw_x = np.copy(x)
 
-        x = transforms.convert_image(x, channel_axis=channel_axis,
-                                        z_axis=z_axis, 
-                                        do_3D=(do_3D or stitch_threshold > 0))
+        # ---> MAGIC TRICK: Bypass Cellpose 'convert_image' completely for 6-channel logic <---
+        if x.ndim == 3 and x.shape[-1] <= 3: 
+            x = x.transpose(2, 0, 1)
+        if x.ndim == 4 and x.shape[-1] <= 3: 
+            x = x.transpose(0, 3, 1, 2)
         
+        # Remove zero-padded 3rd channel if present
+        if x.ndim == 3 and x.shape[0] == 3 and np.max(x[2]) == 0 and np.min(x[2]) == 0: 
+            x = x[:2]
+        if x.ndim == 4 and x.shape[1] == 3 and np.max(x[:, 2]) == 0 and np.min(x[:, 2]) == 0: 
+            x = x[:, :2]
+
+        # Duplicate C1x3, C2x3 to form the 6-channel sequence
+        if x.ndim == 3 and x.shape[0] == 2:
+            x = np.concatenate([np.repeat(x[0:1], 3, axis=0), np.repeat(x[1:2], 3, axis=0)], axis=0)
+        elif x.ndim == 4 and x.shape[1] == 2:
+            x = np.concatenate([np.repeat(x[:, 0:1], 3, axis=1), np.repeat(x[:, 1:2], 3, axis=1)], axis=1)
+
         if x.ndim < 4:
             x = x[np.newaxis, ...]
         nimg = x.shape[0]
@@ -432,8 +456,12 @@ class CellposeModel():
                 import matplotlib.patches as mpatches
 
                 img_display = raw_x.squeeze()
-                if img_display.ndim > 2 and img_display.shape[0] in [1, 3, 4]:
+                
+                # Safe transposition for 2, 3, 4, or 6 channel arrays
+                if img_display.ndim > 2 and img_display.shape[0] in [2, 3, 4, 6]:
                     img_display = img_display.transpose(1, 2, 0)
+                    
+                # We only need the first 3 channels for matplotlib visualization
                 if img_display.ndim > 2 and img_display.shape[-1] > 3:
                     img_display = img_display[..., :3]
 
