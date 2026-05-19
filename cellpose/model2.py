@@ -90,6 +90,16 @@ class DualPathTransformer(nn.Module):
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
         self.org_out = copy.deepcopy(base_net.out)
         
+        # BREAK THE SYMMETRY: Scramble Organelle weights so it learns independently
+        for m in self.org_neck.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+        for m in self.org_out.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+        
         # Disconnect original neck and out to prevent double-processing
         self.base_net.encoder.neck = nn.Identity()
         self.base_net.out = nn.Identity()
@@ -104,6 +114,7 @@ class DualPathTransformer(nn.Module):
     def dtype(self):
         return self._true_dtype
 
+    # ---> NEW FIX: Add a setter so train.py can actually change the dtype!
     @dtype.setter
     def dtype(self, new_dtype):
         self._true_dtype = new_dtype
@@ -129,7 +140,7 @@ class DualPathTransformer(nn.Module):
         # Safety cast to prevent mixed precision errors
         x = x.to(self._true_dtype)
         
-        # 1. Get raw ViT features
+        # 1. Get raw ViT features [B, 1024, 32, 32]
         feat = self.base_net.encoder(x) 
         
         if self.active_head == 'cells':
@@ -185,9 +196,11 @@ class CellposeModel():
         if model_type is not None:
             models_logger.warning("model_type argument is not used in v4.0.1+. Ignoring this argument...")
         
-        # Default to 6 channels for the multi-channel stack
+        # Default to 3 channels (RGB mode), train.py will pass 6 if two_tail=True
         if nchan is None:
-            nchan = 6
+            nchan = 3
+            
+        self.nchan = nchan
 
         ### assign model device
         self.device = assign_device(gpu=gpu)[0] if device is None else device
@@ -231,15 +244,15 @@ class CellposeModel():
                 base_net.load_model(self.pretrained_model, device=self.device)
 
         # =================================================================
-        # 3. DYNAMIC INPUT CHANNEL MODIFICATION (e.g. 3 -> 6)
+        # 3. DYNAMIC INPUT CHANNEL MODIFICATION (6-channel switch)
         # =================================================================
-        if nchan != 3:
-            models_logger.info(f"Modifying input patch_embed from 3 to {nchan} channels...")
+        if self.nchan != 3:
+            models_logger.info(f"Modifying input patch_embed from 3 to {self.nchan} channels...")
             patch_embed = base_net.encoder.patch_embed
             for name, layer in patch_embed.named_children():
                 if isinstance(layer, nn.Conv2d):
                     new_conv = nn.Conv2d(
-                        in_channels=nchan,
+                        in_channels=self.nchan,
                         out_channels=layer.out_channels,
                         kernel_size=layer.kernel_size,
                         stride=layer.stride,
@@ -247,18 +260,19 @@ class CellposeModel():
                         bias=(layer.bias is not None)
                     )
                     with torch.no_grad():
-                        # Copy the original pretrained weights for the first 3 channels
-                        new_conv.weight[:, :3, :, :] = layer.weight.clone()
+                        # Divide weights by 2 so adding them together doesn't blow up gradients
+                        half_weight = layer.weight.clone() / 2.0
                         
-                        # Zero-initialize the new stacked channels
-                        nn.init.zeros_(new_conv.weight[:, 3:, :, :])
+                        # Apply to channels 0,1,2 (Cells) and 3,4,5 (Organelles)
+                        new_conv.weight[:, :3, :, :] = half_weight
+                        new_conv.weight[:, 3:, :, :] = half_weight
                         
                         if layer.bias is not None:
                             new_conv.bias.copy_(layer.bias)
                             
                     setattr(patch_embed, name, new_conv)
                     getattr(patch_embed, name).to(dtype=dtype, device=self.device)
-                    models_logger.info("Input channel modification complete!")
+                    models_logger.info(f"Input {self.nchan}-channel modification complete!")
                     break
 
         # 4. Wrap in DualPath Architecture
@@ -349,7 +363,7 @@ class CellposeModel():
         ############# actual eval code ############
         raw_x = np.copy(x)
 
-        # ---> MAGIC TRICK: Bypass Cellpose 'convert_image' completely for 6-channel logic <---
+        # ---> THE DYNAMIC CHANNEL EVALUATION BYPASS <---
         # 1. Force channels to the LAST axis (H, W, C) for core.run_net
         if x.ndim == 3 and x.shape[0] in [2, 3, 6]: 
             x = x.transpose(1, 2, 0)
@@ -362,11 +376,17 @@ class CellposeModel():
         if x.ndim == 4 and x.shape[-1] == 3 and np.max(x[..., 2]) == 0 and np.min(x[..., 2]) == 0: 
             x = x[..., :2]
 
-        # 3. Duplicate C1x3, C2x3 to form the 6-channel sequence
+        # 3. Dynamic Padding based on self.nchan (two_tail logic)
         if x.ndim == 3 and x.shape[-1] == 2:
-            x = np.concatenate([np.repeat(x[..., 0:1], 3, axis=-1), np.repeat(x[..., 1:2], 3, axis=-1)], axis=-1)
+            if self.nchan == 6:
+                x = np.concatenate([np.repeat(x[..., 0:1], 3, axis=-1), np.repeat(x[..., 1:2], 3, axis=-1)], axis=-1)
+            else:
+                x = np.concatenate([x[..., 0:1], x[..., 1:2], np.zeros_like(x[..., 0:1])], axis=-1)
         elif x.ndim == 4 and x.shape[-1] == 2:
-            x = np.concatenate([np.repeat(x[..., 0:1], 3, axis=-1), np.repeat(x[..., 1:2], 3, axis=-1)], axis=-1)
+            if self.nchan == 6:
+                x = np.concatenate([np.repeat(x[..., 0:1], 3, axis=-1), np.repeat(x[..., 1:2], 3, axis=-1)], axis=-1)
+            else:
+                x = np.concatenate([x[..., 0:1], x[..., 1:2], np.zeros_like(x[..., 0:1])], axis=-1)
 
         if x.ndim < 4:
             x = x[np.newaxis, ...]
@@ -454,14 +474,10 @@ class CellposeModel():
 
                 img_display = raw_x.squeeze()
                 
-                # Safe transposition for 2, 3, 4, or 6 channel arrays
+                # Safe transposition for 3 or 6 channel arrays
                 if img_display.ndim > 2 and img_display.shape[0] in [2, 3, 4, 6]:
                     img_display = img_display.transpose(1, 2, 0)
                     
-                # We only need the first 3 channels for matplotlib visualization
-                if img_display.ndim > 2 and img_display.shape[-1] > 3:
-                    img_display = img_display[..., :3]
-
                 if img_display.max() > 1.0:
                     img_display = (img_display - img_display.min()) / (img_display.max() - img_display.min())
 
@@ -474,12 +490,12 @@ class CellposeModel():
                 for row, head in enumerate(heads_to_process):
                     pred_mask = all_masks[row]
                     
-                    # Extract channel for grayscale display (Red for Cells, Green for Organelles)
-                    chan_idx = 0 if head == 'cells' else 1
-                    if img_display.ndim == 3 and img_display.shape[-1] >= 2:
+                    # Extract correct channel based on dynamic nchan
+                    chan_idx = 0 if head == 'cells' else (3 if self.nchan == 6 else 1)
+                    if img_display.ndim == 3 and img_display.shape[-1] > chan_idx:
                         img_show = img_display[..., chan_idx]
                     else:
-                        img_show = img_display
+                        img_show = img_display[..., 0] # Fallback
                     
                     axes[row][0].imshow(img_show, cmap='gray')
                     title_gt = f"Original Input ({head})"
