@@ -86,7 +86,7 @@ class DualPathTransformer(nn.Module):
         self.cell_neck = copy.deepcopy(base_net.encoder.neck)
         self.cell_out = copy.deepcopy(base_net.out)
         
-        # Deep clone the Neck and Head for Organelles (KEEPS PRETRAINED WEIGHTS SO IT CAN FIND LYSOSOMES!)
+        # Deep clone the Neck and Head for Organelles (KEEPS PRETRAINED WEIGHTS NOW!)
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
         self.org_out = copy.deepcopy(base_net.out)
         
@@ -145,7 +145,7 @@ class DualPathTransformer(nn.Module):
             return out_o, style
             
         else:
-            # === Both mode for Training Loop ===
+            # === RESTORED: Both mode for Training Loop ===
             # Cell Path
             feat_c = self.cell_neck(feat)
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
@@ -350,22 +350,23 @@ class CellposeModel():
         raw_x = np.copy(x)
 
         # ---> MAGIC TRICK: Bypass Cellpose 'convert_image' completely for 6-channel logic <---
-        if x.ndim == 3 and x.shape[-1] <= 3: 
-            x = x.transpose(2, 0, 1)
-        if x.ndim == 4 and x.shape[-1] <= 3: 
-            x = x.transpose(0, 3, 1, 2)
+        # 1. Force channels to the LAST axis (H, W, C) for core.run_net
+        if x.ndim == 3 and x.shape[0] in [2, 3, 6]: 
+            x = x.transpose(1, 2, 0)
+        if x.ndim == 4 and x.shape[1] in [2, 3, 6]: 
+            x = x.transpose(0, 2, 3, 1)
         
-        # Remove zero-padded 3rd channel if present
-        if x.ndim == 3 and x.shape[0] == 3 and np.max(x[2]) == 0 and np.min(x[2]) == 0: 
-            x = x[:2]
-        if x.ndim == 4 and x.shape[1] == 3 and np.max(x[:, 2]) == 0 and np.min(x[:, 2]) == 0: 
-            x = x[:, :2]
+        # 2. Remove zero-padded 3rd channel if present
+        if x.ndim == 3 and x.shape[-1] == 3 and np.max(x[..., 2]) == 0 and np.min(x[..., 2]) == 0: 
+            x = x[..., :2]
+        if x.ndim == 4 and x.shape[-1] == 3 and np.max(x[..., 2]) == 0 and np.min(x[..., 2]) == 0: 
+            x = x[..., :2]
 
-        # Duplicate C1x3, C2x3 to form the 6-channel sequence
-        if x.ndim == 3 and x.shape[0] == 2:
-            x = np.concatenate([np.repeat(x[0:1], 3, axis=0), np.repeat(x[1:2], 3, axis=0)], axis=0)
-        elif x.ndim == 4 and x.shape[1] == 2:
-            x = np.concatenate([np.repeat(x[:, 0:1], 3, axis=1), np.repeat(x[:, 1:2], 3, axis=1)], axis=1)
+        # 3. Duplicate C1x3, C2x3 to form the 6-channel sequence
+        if x.ndim == 3 and x.shape[-1] == 2:
+            x = np.concatenate([np.repeat(x[..., 0:1], 3, axis=-1), np.repeat(x[..., 1:2], 3, axis=-1)], axis=-1)
+        elif x.ndim == 4 and x.shape[-1] == 2:
+            x = np.concatenate([np.repeat(x[..., 0:1], 3, axis=-1), np.repeat(x[..., 1:2], 3, axis=-1)], axis=-1)
 
         if x.ndim < 4:
             x = x[np.newaxis, ...]
