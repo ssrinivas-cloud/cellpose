@@ -101,7 +101,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, auto_unfreeze=False, 
-              turnoff_cell_loss=False, two_tail=False, **kwargs):
+              turnoff_cell_loss=False, two_tail=False, cell_loss_coeff=1,org_loss_coeff=1, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -238,7 +238,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 # ---> DYNAMIC LOSS TOGGLE <---
                 if not turnoff_cell_loss:
                     loss_cell = _loss_fn_seg(L_c, y_cell, device)
-                    loss = (loss_cell + loss_org) / accumulation_steps
+                    loss = (cell_loss_coeff*loss_cell + org_loss_coeff*loss_org) / accumulation_steps
                 else:
                     loss = loss_org / accumulation_steps
 
@@ -294,7 +294,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                             
                             if not turnoff_cell_loss:
                                 loss_c = _loss_fn_seg(L_c, y_cell, device)
-                                loss = loss_c + loss_o
+                                loss = cell_loss_coeff*loss_c + org_loss_coeff*loss_o
                             else:
                                 loss = loss_o
                         
