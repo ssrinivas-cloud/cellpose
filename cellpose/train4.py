@@ -117,14 +117,23 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     nimg = len(train_data)
     nimg_test = len(test_data) if test_data else 0
 
-    # ---> UPDATED LEARNING RATE SCHEDULE <---
-    # Strictly decreasing linear decay from learning_rate down to 1% of learning_rate
-    # By passing n_epochs=100 here, it will automatically make the decay rate very slow.
+    # ---> RESTORED WARMUP + SLOW LINEAR DECAY <---
+    # 1. Dedicate the first 10% of epochs (max 10) to safely warming up the optimizer
+    warmup_epochs = min(10, n_epochs // 10) 
+    decay_epochs = max(0, n_epochs - warmup_epochs)
+    
+    # Start at 0 and slowly climb to your target learning_rate
+    LR_warmup = np.linspace(0, learning_rate, warmup_epochs) if warmup_epochs > 0 else np.array([])
+    
+    # 2. Strictly decrease from learning_rate down to 1% of learning_rate over the remaining epochs
     min_lr = learning_rate * 0.01 
-    LR = np.linspace(learning_rate, min_lr, n_epochs)
+    LR_decay = np.linspace(learning_rate, min_lr, decay_epochs) if decay_epochs > 0 else np.array([])
+    
+    # Combine the schedules
+    LR = np.concatenate([LR_warmup, LR_decay])
     
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}, two_tail={two_tail}")
-    train_logger.info(f">>> AdamW, Initial LR={learning_rate:0.6f}, Final LR={min_lr:0.6f}, weight_decay={weight_decay:0.5f}")
+    train_logger.info(f">>> AdamW, Peak LR={learning_rate:0.6f}, Final LR={min_lr:0.6f}, weight_decay={weight_decay:0.5f}")
     
     # --- ABLATION CONFLICT CHECK & LOGGING ---
     if turnoff_cell_loss and only_cell_loss:
@@ -169,7 +178,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     
     for iepoch in range(n_epochs):
         rperm = np.random.permutation(nimg)
-        # Apply the smoothly decreasing learning rate for this specific epoch
+        # Apply the current epoch's learning rate (warmup -> steady decay)
         for param_group in optimizer.param_groups: 
             param_group["lr"] = LR[iepoch]
         
@@ -210,7 +219,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
             if (k // batch_size + 1) % accumulation_steps == 0 or (k + batch_size) >= nimg:
                 scaler.unscale_(optimizer)
-                # ---> UPDATED GRADIENT CLIPPING (0.5 instead of 1.0 for better stability) <---
+                # ---> GRADIENT CLIPPING AT 0.5 FOR STABILITY <---
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
                 scaler.step(optimizer)
                 scaler.update()
