@@ -101,7 +101,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, auto_unfreeze=False, 
-              turnoff_cell_loss=False, two_tail=False, cell_loss_coeff=1,org_loss_coeff=1, **kwargs):
+              turnoff_cell_loss=False, only_cell_loss=False, two_tail=False, 
+              cell_loss_coeff=1, org_loss_coeff=1, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -125,8 +126,14 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}, two_tail={two_tail}")
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
     
+    # ---> ABLATION CONFLICT CHECK & LOGGING <---
+    if turnoff_cell_loss and only_cell_loss:
+        raise ValueError("You cannot have both 'turnoff_cell_loss' and 'only_cell_loss' set to True.")
+
     if turnoff_cell_loss:
         train_logger.info(">>> [ABLATION MODE] Cell Loss is turned OFF. Training Organelles only.")
+    elif only_cell_loss:
+        train_logger.info(">>> [ABLATION MODE] Organelle Loss is turned OFF. Training Cells only.")
 
     is_frozen = False
     if auto_unfreeze:
@@ -179,7 +186,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
             imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
             lbl_c_aug, lbl_o_aug = lbl_aug[:, :3, :, :], lbl_aug[:, 3:, :, :]
-                                                 
+                                                          
             X = torch.from_numpy(imgi).to(device)
             L_c = torch.from_numpy(lbl_c_aug).to(device)
             L_o = torch.from_numpy(lbl_o_aug).to(device)
@@ -232,15 +239,18 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     except Exception as e:
                         train_logger.warning(f"Debug plotting failed: {e}")
                 # ==========================================================
-
-                loss_org = _loss_fn_org(L_o, y_org, device) 
                 
-                # ---> DYNAMIC LOSS TOGGLE <---
-                if not turnoff_cell_loss:
+                # ---> DYNAMIC LOSS TOGGLE (TRAINING) <---
+                if only_cell_loss:
                     loss_cell = _loss_fn_seg(L_c, y_cell, device)
-                    loss = (cell_loss_coeff*loss_cell + org_loss_coeff*loss_org) / accumulation_steps
-                else:
+                    loss = loss_cell / accumulation_steps
+                elif turnoff_cell_loss:
+                    loss_org = _loss_fn_org(L_o, y_org, device) 
                     loss = loss_org / accumulation_steps
+                else:
+                    loss_cell = _loss_fn_seg(L_c, y_cell, device)
+                    loss_org = _loss_fn_org(L_o, y_org, device) 
+                    loss = (cell_loss_coeff*loss_cell + org_loss_coeff*loss_org) / accumulation_steps
 
             scaler.scale(loss).backward()
             
@@ -290,13 +300,17 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                             outputs, style = net(X) 
                             y_cell, y_org = outputs
                             
-                            loss_o = _loss_fn_org(L_o, y_org, device) 
-                            
-                            if not turnoff_cell_loss:
+                            # ---> DYNAMIC LOSS TOGGLE (EVALUATION) <---
+                            if only_cell_loss:
                                 loss_c = _loss_fn_seg(L_c, y_cell, device)
-                                loss = cell_loss_coeff*loss_c + org_loss_coeff*loss_o
-                            else:
+                                loss = loss_c
+                            elif turnoff_cell_loss:
+                                loss_o = _loss_fn_org(L_o, y_org, device) 
                                 loss = loss_o
+                            else:
+                                loss_c = _loss_fn_seg(L_c, y_cell, device)
+                                loss_o = _loss_fn_org(L_o, y_org, device) 
+                                loss = cell_loss_coeff*loss_c + org_loss_coeff*loss_o
                         
                         lavgt += loss.item() * len(imgi)
                 lavgt /= nimg_test
