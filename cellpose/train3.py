@@ -6,6 +6,7 @@ import time
 import os
 import numpy as np
 import scipy.ndimage
+import matplotlib.pyplot as plt  # Added to top-level imports for clean execution
 from cellpose import io, utils, model2, dynamics
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
@@ -126,7 +127,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}, two_tail={two_tail}")
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
     
-    # ---> ABLATION CONFLICT CHECK & LOGGING <---
+    # --- ABLATION CONFLICT CHECK & LOGGING ---
     if turnoff_cell_loss and only_cell_loss:
         raise ValueError("You cannot have both 'turnoff_cell_loss' and 'only_cell_loss' set to True.")
 
@@ -186,7 +187,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
             imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
             lbl_c_aug, lbl_o_aug = lbl_aug[:, :3, :, :], lbl_aug[:, 3:, :, :]
-                                                          
+                                                       
             X = torch.from_numpy(imgi).to(device)
             L_c = torch.from_numpy(lbl_c_aug).to(device)
             L_o = torch.from_numpy(lbl_o_aug).to(device)
@@ -196,7 +197,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 y_cell, y_org = outputs
                 
                 # ==========================================================
-                # TRAINING PIPELINE DEBUG VISUALIZATION
+                # TRAINING PIPELINE DEBUG VISUALIZATION (CROP LEVEL)
                 # ==========================================================
                 if debug and k == 0:
                     y_c_np = (y_cell[0, -1] > 0.0).detach().cpu().numpy()
@@ -208,25 +209,19 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     train_logger.info(f"[DEBUG] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
 
                     try:
-                        import matplotlib.pyplot as plt
                         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-                        
-                        # Extract the exact crop sent to network (B, C, H, W) based on two_tail
                         img_c = imgi[0, 0] 
                         img_o = imgi[0, 3] if two_tail else imgi[0, 1] 
                         
-                        # Extract GT masks (Index 0 of labels is the flow mask)
                         gt_c = lbl_c_aug[0, 0] > 0
                         gt_o = lbl_o_aug[0, 0] > 0
                         
-                        # Plot Cells
                         axes[0].imshow(img_c, cmap='gray')
                         if np.any(gt_c): axes[0].contour(gt_c, colors='lime', linewidths=1.0)
                         if np.any(y_c_np): axes[0].contour(y_c_np, colors='red', linewidths=1.0, linestyles='dashed')
                         axes[0].set_title(f"Cells (GT: Lime, Pred: Red)")
                         axes[0].axis('off')
                         
-                        # Plot Organelles
                         axes[1].imshow(img_o, cmap='gray')
                         if np.any(gt_o): axes[1].contour(gt_o, colors='lime', linewidths=1.0)
                         if np.any(y_o_np): axes[1].contour(y_o_np, colors='red', linewidths=1.0, linestyles='dashed')
@@ -238,7 +233,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         plt.close(fig)
                     except Exception as e:
                         train_logger.warning(f"Debug plotting failed: {e}")
-                # ==========================================================
                 
                 # ---> DYNAMIC LOSS TOGGLE (TRAINING) <---
                 if only_cell_loss:
@@ -320,22 +314,22 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         train_logger.info(f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s")
         lavg, nsum = 0, 0
 
-        # ==========================================================
-        # FULL IMAGE DEBUG EVALUATION (ONLY TRIGGERED IF DEBUG=TRUE)
-        # ==========================================================
+        # =====================================================================
+        # FULL IMAGE POST-PROCESSING EVALUATION & VISUALIZATION (UPDATED)
+        # =====================================================================
         if debug and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
             
-            # ---> THE CRITICAL FIX: Force use_bfloat16=False so the eval model perfectly mirrors the float32 training weights <---
-            # ---> DYNAMIC INSTANTIATION: Use 6 channels if two_tail=True, else 3 channels <---
+            # Instantiate evaluation model exactly matching the float32 state weights
             eval_model = model2.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
             
+            # Compute full post-processed instance mask reconstructions via dynamics step
             masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
             gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
             
-            # --- COUNT MASK INSTANCES ---
+            # Extract final instance metrics
             n_cells_pred = pred_cells[0].max() if np.any(pred_cells[0]) else 0
             n_orgs_pred = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
             n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
@@ -348,45 +342,68 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 for gt, pred in zip(gt_masks, pred_masks):
                     gt_bin, pred_bin = gt > 0, pred > 0
                     tp += np.logical_and(gt_bin, pred_bin).sum()
-                    fp += np.logical_and(~gt_bin, pred_bin).sum(); fn += np.logical_and(gt_bin, ~pred_bin).sum()  
+                    fp += np.logical_and(~gt_bin, pred_bin).sum()
+                    fn += np.logical_and(gt_bin, ~pred_bin).sum()  
                 return tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
             
             train_logger.info(f"--- [DEBUG] Test IOU -> CELLS: {calc_metrics(gt_cells, pred_cells):.4f} | ORGANELLES: {calc_metrics(gt_orgs, pred_orgs):.4f} ---")
 
+            # ---> UPDATED POST-PROCESSING OVERLAY VISUALIZATION <---
             if visualize:
                 try:
-                    import matplotlib.pyplot as plt
-                    import matplotlib.patches as mpatches
-                    fig, axes = plt.subplots(2, 2, figsize=(14, 14))
-                    img_disp = test_data[0].copy()
+                    fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+                    fig.suptitle(f"Epoch {iepoch} - Post-Processed Mask Reconstructions", fontsize=18, y=0.98)
                     
+                    img_disp = test_data[0].copy()
+                    # Reconstruct spatial dimensions for plotting frameworks (H, W, C)
                     if img_disp.ndim == 3 and img_disp.shape[0] in [2, 3, 6]:
                         img_disp = img_disp.transpose(1, 2, 0)
-                    if img_disp.max() > 1.0: 
+                    
+                    # Normalize pixels dynamically to secure clean contours without dynamic clipping artifacts
+                    if img_disp.max() > img_disp.min(): 
                         img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
                     
+                    # Extract backgrounds depending on dynamic pipeline structures
                     img_cell = img_disp[..., 0] 
-                    axes[0, 0].imshow(img_cell, cmap='gray'); axes[0, 0].contour(gt_cells[0]>0, colors='lime', linewidths=0.5)
-                    axes[0, 0].set_title(f"Cells - Actual GT ({n_cells_gt} masks)")
-                    
-                    axes[0, 1].imshow(img_cell, cmap='gray'); axes[0, 1].contour(pred_cells[0]>0, colors='red', linewidths=0.5)
-                    axes[0, 1].set_title(f"Cells - Predicted ({n_cells_pred} masks)")
-                    
-                    # Ensure dynamic channel lookup based on two_tail
                     img_org = img_disp[..., 3] if two_tail else (img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0])
                     
-                    axes[1, 0].imshow(img_org, cmap='gray'); axes[1, 0].contour(gt_orgs[0]>0, colors='lime', linewidths=0.5)
-                    axes[1, 0].set_title(f"Organelles - Actual GT ({n_orgs_gt} masks)")
+                    # --- ROW 1: CELLS ---
+                    axes[0, 0].imshow(img_cell, cmap='gray')
+                    if np.any(gt_cells[0]): 
+                        axes[0, 0].contour(gt_cells[0] > 0, colors='lime', linewidths=1.2)
+                    axes[0, 0].set_title(f"Cells - Actual GT ({n_cells_gt} masks)", fontsize=12)
+                    axes[0, 0].axis('off')
                     
-                    axes[1, 1].imshow(img_org, cmap='gray'); axes[1, 1].contour(pred_orgs[0]>0, colors='red', linewidths=0.5)
-                    axes[1, 1].set_title(f"Organelles - Predicted ({n_orgs_pred} masks)")
+                    axes[0, 1].imshow(img_cell, cmap='gray')
+                    if np.any(pred_cells[0]): 
+                        axes[0, 1].contour(pred_cells[0] > 0, colors='red', linewidths=1.2)
+                    axes[0, 1].set_title(f"Cells - Predicted Reconstructed ({n_cells_pred} masks)", fontsize=12)
+                    axes[0, 1].axis('off')
                     
-                    plt.tight_layout(); plt.savefig(save_path / f"epoch_{iepoch:04d}_eval_vis.png"); plt.close(fig)
-                except: pass
+                    # --- ROW 2: ORGANELLES ---
+                    axes[1, 0].imshow(img_org, cmap='gray')
+                    if np.any(gt_orgs[0]): 
+                        axes[1, 0].contour(gt_orgs[0] > 0, colors='lime', linewidths=1.2)
+                    axes[1, 0].set_title(f"Organelles - Actual GT ({n_orgs_gt} masks)", fontsize=12)
+                    axes[1, 0].axis('off')
+                    
+                    axes[1, 1].imshow(img_org, cmap='gray')
+                    if np.any(pred_orgs[0]): 
+                        axes[1, 1].contour(pred_orgs[0] > 0, colors='red', linewidths=1.2)
+                    axes[1, 1].set_title(f"Organelles - Predicted Reconstructed ({n_orgs_pred} masks)", fontsize=12)
+                    axes[1, 1].axis('off')
+                    
+                    plt.tight_layout()
+                    vis_save_path = save_path / f"epoch_{iepoch:04d}_post_processed_overlay.png"
+                    plt.savefig(vis_save_path, bbox_inches='tight', dpi=150)
+                    plt.close(fig)
+                    train_logger.info(f"[DEBUG] Post-processing visualization overlay written to: {vis_save_path}")
+                except Exception as e:
+                    train_logger.warning(f"Post-processed overlay execution block errored: {e}")
             
             del eval_model
             torch.cuda.empty_cache()
-        # ==========================================================
+        # =====================================================================
 
     if original_net_dtype != torch.float32: net.dtype = original_net_dtype
 
