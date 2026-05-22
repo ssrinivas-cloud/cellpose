@@ -8,6 +8,7 @@ import numpy as np
 from tqdm import trange
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter
 import gc
 import cv2
@@ -66,10 +67,87 @@ def get_user_models():
     return model_strings
 
 
+# =========================================================================
+# NEW MODULE 1: The Bright-Field Cleaner (Selective Stem)
+# =========================================================================
+class ChannelSelectiveStem(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Processes ONLY the first channel (Bright-field), smoothing internal noise
+        self.bf_cleaner = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.InstanceNorm2d(16),
+            nn.GELU(),
+            nn.Conv2d(16, 16, kernel_size=5, stride=1, padding=2, bias=False),
+            nn.InstanceNorm2d(16),
+            nn.GELU(),
+            nn.Conv2d(16, 1, kernel_size=3, stride=1, padding=1)
+        )
+
+    def forward(self, x):
+        # x is (Batch, Channels, Height, Width)
+        bf_channel = x[:, 0:1, :, :]    # Isolate Bright-field (Channel 0)
+        other_channels = x[:, 1:, :, :] # Isolate the untouched fluorescent/other channels
+        
+        cleaned_bf = self.bf_cleaner(bf_channel)
+        
+        # Merge back together
+        out = torch.cat([cleaned_bf, other_channels], dim=1)
+        return out
+
+
+# =========================================================================
+# NEW MODULE 2: The Hole Filler (ASPP Neck)
+# =========================================================================
+class ASPPNeck(nn.Module):
+    def __init__(self, in_channels=256, out_channels=256):
+        super().__init__()
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.branch4 = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.project = nn.Sequential(
+            nn.Conv2d(out_channels * 4, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1)
+        )
+
+    def forward(self, x):
+        _, _, h, w = x.shape
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        b4 = F.interpolate(self.branch4(x), size=(h, w), mode='bilinear', align_corners=False)
+        out = torch.cat([b1, b2, b3, b4], dim=1)
+        return self.project(out)
+
+
+# =========================================================================
+# MODIFIED: DualPathTransformer with Integrations
+# =========================================================================
 class DualPathTransformer(nn.Module):
     """
     Wraps the ViT backbone to safely split the architecture at the Neck.
-    Handles the PixelShuffle reshape natively.
+    Handles the PixelShuffle reshape natively. Now integrated with 
+    Selective Stem and ASPP Necks for Bright-field stability.
     """
     def __init__(self, base_net, randomize_org=False):
         super().__init__()
@@ -82,12 +160,17 @@ class DualPathTransformer(nn.Module):
         self.diam_mean = getattr(base_net, 'diam_mean', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         
+        # --- NEW: Trainable Pixel-level Preprocessor ---
+        self.stem = ChannelSelectiveStem()
+
         # Deep clone the Neck and Head for Cells (Keeps Pretrained Weights)
         self.cell_neck = copy.deepcopy(base_net.encoder.neck)
+        self.cell_aspp = ASPPNeck(in_channels=256, out_channels=256) # --- NEW: Trainable ASPP ---
         self.cell_out = copy.deepcopy(base_net.out)
         
         # Deep clone the Neck and Head for Organelles 
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
+        self.org_aspp = ASPPNeck(in_channels=256, out_channels=256)  # --- NEW: Trainable ASPP ---
         self.org_out = copy.deepcopy(base_net.out)
         
         # ---> OPTIONAL SYMMETRY BREAKING (Ablation toggle) <---
@@ -116,7 +199,6 @@ class DualPathTransformer(nn.Module):
     def dtype(self):
         return self._true_dtype
 
-    # ---> NEW FIX: Add a setter so train.py can actually change the dtype!
     @dtype.setter
     def dtype(self, new_dtype):
         self._true_dtype = new_dtype
@@ -124,7 +206,7 @@ class DualPathTransformer(nn.Module):
 
     def load_model(self, path, device):
         """ Safe hook for train.py to load the weights """
-        self.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+        self.load_state_dict(torch.load(path, map_location=device, weights_only=True), strict=False)
 
     def save_model(self, path):
         """ Safe hook for train.py to save the weights """
@@ -142,30 +224,36 @@ class DualPathTransformer(nn.Module):
         # Safety cast to prevent mixed precision errors
         x = x.to(self._true_dtype)
         
-        # 1. Get raw ViT features [B, 1024, 32, 32]
+        # --- 1. Clean Bright-field noise ---
+        x = self.stem(x)
+        
+        # --- 2. Get raw ViT features ---
         feat = self.base_net.encoder(x) 
         
         if self.active_head == 'cells':
             feat_c = self.cell_neck(feat)
+            feat_c = self.cell_aspp(feat_c) # ASPP Hole Filling
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
             style = torch.mean(feat_c, dim=(2, 3))
             return out_c, style
             
         elif self.active_head == 'organelles':
             feat_o = self.org_neck(feat)
+            feat_o = self.org_aspp(feat_o) # ASPP Hole Filling
             out_o = self.pixel_shuffle(self.org_out(feat_o))
             style = torch.mean(feat_o, dim=(2, 3))
             return out_o, style
             
         else:
-            # === RESTORED: Both mode for Training Loop ===
             # Cell Path
             feat_c = self.cell_neck(feat)
+            feat_c = self.cell_aspp(feat_c) # ASPP Hole Filling
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
             style_c = torch.mean(feat_c, dim=(2, 3))
             
             # Organelle Path
             feat_o = self.org_neck(feat)
+            feat_o = self.org_aspp(feat_o) # ASPP Hole Filling
             out_o = self.pixel_shuffle(self.org_out(feat_o))
             style_o = torch.mean(feat_o, dim=(2, 3))
             
@@ -298,17 +386,18 @@ class CellposeModel():
     def set_freeze_backbone(self, freeze=True):
         """
         Dynamically freezes or unfreezes the ViT backbone.
-        The deep dual-decoder paths will ALWAYS remain unfrozen.
+        The stem, ASPP necks, and deep dual-decoder paths will ALWAYS remain unfrozen.
         """
         self.freeze_backbone = freeze
         if freeze:
-            models_logger.info("\n>>> [MODELS] FREEZING BACKBONE: Only the Dual Decoder Paths will be trained.")
+            models_logger.info("\n>>> [MODELS] FREEZING BACKBONE: Only the Stem, Necks, and Dual Decoder Paths will be trained.")
         else:
             models_logger.info("\n>>> [MODELS] UNFREEZING BACKBONE: The entire network will be trained (End-to-End).")
             
         for name, param in self.net.named_parameters():
-            if 'cell_neck' in name or 'cell_out' in name or 'org_neck' in name or 'org_out' in name:
-                param.requires_grad = True  # Deep Upsampling Paths ALWAYS train
+            # Ensure our new components and the heads are always training
+            if any(k in name for k in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'stem', 'cell_aspp', 'org_aspp']):
+                param.requires_grad = True  
             else:
                 param.requires_grad = not freeze # ViT Backbone toggles
 
