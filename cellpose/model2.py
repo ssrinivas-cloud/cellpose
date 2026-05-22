@@ -91,7 +91,7 @@ class ChannelSelectiveStem(nn.Module):
         
         cleaned_bf = self.bf_cleaner(bf_channel)
         
-        # Merge back together
+        # Merge back together. Organelles pass through unmodified.
         out = torch.cat([cleaned_bf, other_channels], dim=1)
         return out
 
@@ -160,17 +160,16 @@ class DualPathTransformer(nn.Module):
         self.diam_mean = getattr(base_net, 'diam_mean', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         
-        # --- NEW: Trainable Pixel-level Preprocessor ---
+        # --- Trainable Pixel-level Preprocessor (Modifies BF channel only) ---
         self.stem = ChannelSelectiveStem()
 
         # Deep clone the Neck and Head for Cells (Keeps Pretrained Weights)
         self.cell_neck = copy.deepcopy(base_net.encoder.neck)
-        self.cell_aspp = ASPPNeck(in_channels=256, out_channels=256) # --- NEW: Trainable ASPP ---
+        self.cell_aspp = ASPPNeck(in_channels=256, out_channels=256) # --- Trainable ASPP FOR CELLS ONLY ---
         self.cell_out = copy.deepcopy(base_net.out)
         
-        # Deep clone the Neck and Head for Organelles 
+        # Deep clone the Neck and Head for Organelles (Pristine, no ASPP)
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
-        self.org_aspp = ASPPNeck(in_channels=256, out_channels=256)  # --- NEW: Trainable ASPP ---
         self.org_out = copy.deepcopy(base_net.out)
         
         # ---> OPTIONAL SYMMETRY BREAKING (Ablation toggle) <---
@@ -224,7 +223,7 @@ class DualPathTransformer(nn.Module):
         # Safety cast to prevent mixed precision errors
         x = x.to(self._true_dtype)
         
-        # --- 1. Clean Bright-field noise ---
+        # --- 1. Clean Bright-field noise (Organelles pass untouched) ---
         x = self.stem(x)
         
         # --- 2. Get raw ViT features ---
@@ -232,28 +231,26 @@ class DualPathTransformer(nn.Module):
         
         if self.active_head == 'cells':
             feat_c = self.cell_neck(feat)
-            feat_c = self.cell_aspp(feat_c) # ASPP Hole Filling
+            feat_c = self.cell_aspp(feat_c) # ASPP Hole Filling (CELLS ONLY)
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
             style = torch.mean(feat_c, dim=(2, 3))
             return out_c, style
             
         elif self.active_head == 'organelles':
             feat_o = self.org_neck(feat)
-            feat_o = self.org_aspp(feat_o) # ASPP Hole Filling
-            out_o = self.pixel_shuffle(self.org_out(feat_o))
+            out_o = self.pixel_shuffle(self.org_out(feat_o)) # Pristine path
             style = torch.mean(feat_o, dim=(2, 3))
             return out_o, style
             
         else:
-            # Cell Path
+            # Cell Path (Includes ASPP)
             feat_c = self.cell_neck(feat)
-            feat_c = self.cell_aspp(feat_c) # ASPP Hole Filling
+            feat_c = self.cell_aspp(feat_c) # ASPP Hole Filling (CELLS ONLY)
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
             style_c = torch.mean(feat_c, dim=(2, 3))
             
-            # Organelle Path
+            # Organelle Path (Pristine, No ASPP)
             feat_o = self.org_neck(feat)
-            feat_o = self.org_aspp(feat_o) # ASPP Hole Filling
             out_o = self.pixel_shuffle(self.org_out(feat_o))
             style_o = torch.mean(feat_o, dim=(2, 3))
             
@@ -386,7 +383,7 @@ class CellposeModel():
     def set_freeze_backbone(self, freeze=True):
         """
         Dynamically freezes or unfreezes the ViT backbone.
-        The stem, ASPP necks, and deep dual-decoder paths will ALWAYS remain unfrozen.
+        The stem, cell ASPP neck, and deep dual-decoder paths will ALWAYS remain unfrozen.
         """
         self.freeze_backbone = freeze
         if freeze:
@@ -396,7 +393,7 @@ class CellposeModel():
             
         for name, param in self.net.named_parameters():
             # Ensure our new components and the heads are always training
-            if any(k in name for k in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'stem', 'cell_aspp', 'org_aspp']):
+            if any(k in name for k in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'stem', 'cell_aspp']):
                 param.requires_grad = True  
             else:
                 param.requires_grad = not freeze # ViT Backbone toggles
