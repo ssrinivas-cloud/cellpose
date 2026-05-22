@@ -22,25 +22,25 @@ def _loss_fn_class(lbl, y, class_weights=None):
     loss3 = criterion3(y[:, :-3], lbl[:, 0].long())
     return loss3
 
-# --- STANDARD CELL LOSS ---
+# --- STANDARD CELL LOSS (UPDATED TO RETURN COMPONENTS) ---
 def _loss_fn_seg(lbl, y, device):
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
     veci = 5. * lbl[:, -2:]
-    loss = criterion(y[:, -3:-1], veci)
-    loss /= 2. 
-    loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
-    return loss + loss2
+    loss_flow = criterion(y[:, -3:-1], veci)
+    loss_flow /= 2. 
+    loss_prob = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
+    return (loss_flow + loss_prob), loss_flow, loss_prob
 
-# --- STANDARD ORGANELLE LOSS ---
+# --- STANDARD ORGANELLE LOSS (UPDATED TO RETURN COMPONENTS) ---
 def _loss_fn_org(lbl, y, device):
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
     veci = 5. * lbl[:, -2:]
-    loss = criterion(y[:, -3:-1], veci)
-    loss /= 2. 
-    loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
-    return loss + loss2
+    loss_flow = criterion(y[:, -3:-1], veci)
+    loss_flow /= 2. 
+    loss_prob = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
+    return (loss_flow + loss_prob), loss_flow, loss_prob
 
 def _get_batch(inds, data=None, labels_c=None, labels_o=None, two_tail=False):
     imgs = []
@@ -117,25 +117,17 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     nimg = len(train_data)
     nimg_test = len(test_data) if test_data else 0
 
-    # ---> RESTORED WARMUP + SLOW LINEAR DECAY <---
-    # 1. Dedicate the first 10% of epochs (max 10) to safely warming up the optimizer
     warmup_epochs = min(10, n_epochs // 10) 
     decay_epochs = max(0, n_epochs - warmup_epochs)
     
-    # Start at 0 and slowly climb to your target learning_rate
     LR_warmup = np.linspace(0, learning_rate, warmup_epochs) if warmup_epochs > 0 else np.array([])
-    
-    # 2. Strictly decrease from learning_rate down to 1% of learning_rate over the remaining epochs
     min_lr = learning_rate * 0.01 
     LR_decay = np.linspace(learning_rate, min_lr, decay_epochs) if decay_epochs > 0 else np.array([])
-    
-    # Combine the schedules
     LR = np.concatenate([LR_warmup, LR_decay])
     
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}, two_tail={two_tail}")
     train_logger.info(f">>> AdamW, Peak LR={learning_rate:0.6f}, Final LR={min_lr:0.6f}, weight_decay={weight_decay:0.5f}")
     
-    # --- ABLATION CONFLICT CHECK & LOGGING ---
     if turnoff_cell_loss and only_cell_loss:
         raise ValueError("You cannot have both 'turnoff_cell_loss' and 'only_cell_loss' set to True.")
 
@@ -178,7 +170,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     
     for iepoch in range(n_epochs):
         rperm = np.random.permutation(nimg)
-        # Apply the current epoch's learning rate (warmup -> steady decay)
         for param_group in optimizer.param_groups: 
             param_group["lr"] = LR[iepoch]
         
@@ -207,19 +198,45 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 
                 # ---> DYNAMIC LOSS TOGGLE (TRAINING) <---
                 if only_cell_loss:
-                    loss = _loss_fn_seg(L_c, y_cell, device) / accumulation_steps
+                    loss_cell, loss_c_flow, loss_c_prob = _loss_fn_seg(L_c, y_cell, device)
+                    loss = loss_cell / accumulation_steps
                 elif turnoff_cell_loss:
-                    loss = _loss_fn_org(L_o, y_org, device) / accumulation_steps
+                    loss_org, loss_o_flow, loss_o_prob = _loss_fn_org(L_o, y_org, device) 
+                    loss = loss_org / accumulation_steps
                 else:
-                    loss_cell = _loss_fn_seg(L_c, y_cell, device)
-                    loss_org = _loss_fn_org(L_o, y_org, device) 
+                    loss_cell, loss_c_flow, loss_c_prob = _loss_fn_seg(L_c, y_cell, device)
+                    loss_org, loss_o_flow, loss_o_prob = _loss_fn_org(L_o, y_org, device) 
                     loss = (cell_loss_coeff*loss_cell + org_loss_coeff*loss_org) / accumulation_steps
+
+            # ==========================================================
+            # DEEP CELL-LEVEL DEBUG LOGGING (First batch of epoch only)
+            # ==========================================================
+            if debug and k == 0:
+                train_logger.info(f"\n[DEBUG] --- EPOCH {iepoch} DEEP LOSS DIVE ---")
+                
+                if not turnoff_cell_loss:
+                    # 1. Component Breakdown
+                    train_logger.info(f"[DEBUG-CELL] Total Cell Loss: {loss_cell.item():.4f}")
+                    train_logger.info(f"[DEBUG-CELL]  -> Prob (BCE) Loss: {loss_c_prob.item():.4f} (Is it finding the foreground?)")
+                    train_logger.info(f"[DEBUG-CELL]  -> Flow (MSE) Loss: {loss_c_flow.item():.4f} (Is it finding the centers?)")
+                    
+                    # 2. Raw Blob Count check (Before Dynamics)
+                    # Ground truth probability map is at index -3. Predicted logits are at index -1.
+                    gt_c_prob = (L_c[0, -3] > 0.5).cpu().numpy()
+                    pred_c_prob = (y_cell[0, -1] > 0.0).detach().cpu().numpy()
+                    
+                    gt_blobs = scipy.ndimage.label(gt_c_prob)[1]
+                    pred_blobs = scipy.ndimage.label(pred_c_prob)[1]
+                    
+                    train_logger.info(f"[DEBUG-CELL] Crop 0 Raw Blob Check -> Actual GT Cells in Crop: {gt_blobs} | Raw Pred Blobs: {pred_blobs}")
+                    if pred_blobs == 0 and gt_blobs > 0:
+                        train_logger.warning("[DEBUG-CELL] ⚠️ WARNING: Network predicted ZERO foreground cell blobs in this crop. It is blind.")
+            # ==========================================================
 
             scaler.scale(loss).backward()
             
             if (k // batch_size + 1) % accumulation_steps == 0 or (k + batch_size) >= nimg:
                 scaler.unscale_(optimizer)
-                # ---> GRADIENT CLIPPING AT 0.5 FOR STABILITY <---
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
                 scaler.step(optimizer)
                 scaler.update()
@@ -240,7 +257,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             optimizer = torch.optim.AdamW(net.parameters(), lr=LR[iepoch], weight_decay=weight_decay)
             is_frozen = False
 
-        # --- BATCH VALIDATION EVALUATION (RUNS EVERY EPOCH) ---
+        # --- BATCH VALIDATION EVALUATION ---
         lavgt = 0.
         if test_data:
             rperm_test = np.random.permutation(nimg_test)
@@ -265,12 +282,12 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         y_cell, y_org = outputs
                         
                         if only_cell_loss:
-                            loss = _loss_fn_seg(L_c, y_cell, device)
+                            loss, _, _ = _loss_fn_seg(L_c, y_cell, device)
                         elif turnoff_cell_loss:
-                            loss = _loss_fn_org(L_o, y_org, device) 
+                            loss, _, _ = _loss_fn_org(L_o, y_org, device) 
                         else:
-                            loss_c = _loss_fn_seg(L_c, y_cell, device)
-                            loss_o = _loss_fn_org(L_o, y_org, device) 
+                            loss_c, _, _ = _loss_fn_seg(L_c, y_cell, device)
+                            loss_o, _, _ = _loss_fn_org(L_o, y_org, device) 
                             loss = cell_loss_coeff*loss_c + org_loss_coeff*loss_o
                     
                     lavgt += loss.item() * len(imgi)
@@ -282,7 +299,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         lavg, nsum = 0, 0
 
         # =====================================================================
-        # FULL IMAGE POST-PROCESSING EVALUATION & VISUALIZATION (RUNS EVERY EPOCH)
+        # FULL IMAGE POST-PROCESSING EVALUATION & VISUALIZATION
         # =====================================================================
         if debug and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
@@ -299,7 +316,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
             n_orgs_gt = gt_orgs[0].max() if np.any(gt_orgs[0]) else 0
             
-            train_logger.info(f"--- [DEBUG] Full Image Counts -> CELLS: Pred {n_cells_pred} (GT {n_cells_gt}) | ORGS: Pred {n_orgs_pred} (GT {n_orgs_gt}) ---")
+            train_logger.info(f"--- [DEBUG] Full Image Post-Process Counts -> CELLS: Pred {n_cells_pred} (GT {n_cells_gt}) | ORGS: Pred {n_orgs_pred} (GT {n_orgs_gt}) ---")
             
             def calc_metrics(gt_masks, pred_masks):
                 tp = fp = fn = 0
