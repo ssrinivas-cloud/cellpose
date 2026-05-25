@@ -30,7 +30,7 @@ def total_variation_loss(pred_flows):
     return diff_h.mean() + diff_v.mean()
 
 # ---> UPDATED: REBALANCED CELL LOSS <---
-def _loss_fn_seg(lbl, y, device, flow_weight=0.1, tv_weight=0.05):
+def _loss_fn_seg(lbl, y, device, flow_weight=1.0, tv_weight=0.005):
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
     
