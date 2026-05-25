@@ -7,13 +7,16 @@ import os
 import numpy as np
 import scipy.ndimage
 import matplotlib.pyplot as plt  
-from cellpose import io, utils, model3, dynamics
+from cellpose import io, utils, dynamics
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
 from torch import nn
 import logging
 from huggingface_hub import HfApi
+
+# Ensure we are pulling your exact 3-head architecture
+import model6 
 
 train_logger = logging.getLogger(__name__)
 
@@ -68,16 +71,29 @@ def _loss_fn_seg(lbl, y, device, flow_weight=0.5, bce_weight=1.0, dice_weight=2.
     
     return total_loss, loss_prob_total, loss_flow, loss_tv
 
-def _loss_fn_org(lbl, y, device):
-    criterion = nn.MSELoss(reduction="mean")
-    criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
-    veci = 5. * lbl[:, -2:]
-    loss = criterion(y[:, -3:-1], veci)
-    loss /= 2. 
-    loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
+# =========================================================================
+# CRITICAL UPDATE: Organelles now use the Hybrid Dice + BCE Loss
+# =========================================================================
+def _loss_fn_org(lbl, y, device, flow_weight=0.5, bce_weight=1.0, dice_weight=2.0):
+    criterion_mse = nn.MSELoss(reduction="mean")
+    criterion_bce = nn.BCEWithLogitsLoss(reduction="mean")
     
-    total_loss = loss + loss2
-    return total_loss, loss2, loss, torch.tensor(0.0, device=device)
+    veci = 5. * lbl[:, -2:] # GT Org Flows
+    pred_flows = y[:, -3:-1] # Predicted Org Flows
+    
+    target_mask = (lbl[:, -3] > 0.5).to(y.dtype)
+    pred_logits = y[:, -1]
+    
+    # 1. Calculate base losses
+    loss_flow = criterion_mse(pred_flows, veci)
+    loss_bce = criterion_bce(pred_logits, target_mask)
+    loss_dice = dice_loss(pred_logits, target_mask)
+    
+    # 2. Combine (No TV loss needed for tiny organelles)
+    loss_prob_total = (loss_bce * bce_weight) + (loss_dice * dice_weight)
+    total_loss = loss_prob_total + (loss_flow * flow_weight)
+    
+    return total_loss, loss_prob_total, loss_flow, torch.tensor(0.0, device=device)
 
 def _get_batch(inds, data=None, labels_c=None, labels_o=None, two_tail=False):
     imgs = []
@@ -445,7 +461,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         if debug and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
-            eval_model = model3.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
+            eval_model = model6.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
             
             masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
