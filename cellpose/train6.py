@@ -461,7 +461,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         if debug and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
-            eval_model = model6.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
+            eval_model = model3.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
             
             masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
