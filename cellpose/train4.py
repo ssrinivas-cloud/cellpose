@@ -30,7 +30,8 @@ def total_variation_loss(pred_flows):
     return diff_h.mean() + diff_v.mean()
 
 # ---> UPDATED: Returning distinct loss components for debugging <---
-def _loss_fn_seg(lbl, y, device, flow_weight=1.0, tv_weight=0.005):
+# ---> UPDATED: Forcing the network to find ALL cells <---
+def _loss_fn_seg(lbl, y, device, flow_weight=0.5, prob_weight=2.0, tv_weight=0.005):
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
     
@@ -44,10 +45,10 @@ def _loss_fn_seg(lbl, y, device, flow_weight=1.0, tv_weight=0.005):
     # 2. Calculate the smoothness penalty
     loss_tv = total_variation_loss(pred_flows)
     
-    # 3. Rebalance and combine
-    total_loss = loss_prob + (loss_flow * flow_weight) + (loss_tv * tv_weight)
+    # 3. REBALANCE: Punish missing foreground (prob_weight=2.0)
+    # Be more forgiving on messy vectors (flow_weight=0.5)
+    total_loss = (loss_prob * prob_weight) + (loss_flow * flow_weight) + (loss_tv * tv_weight)
     
-    # Return all pieces so the logger can expose them
     return total_loss, loss_prob, loss_flow, loss_tv
 
 # ---> UPDATED: Returning distinct loss components for organelles <---
