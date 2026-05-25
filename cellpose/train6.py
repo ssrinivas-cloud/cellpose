@@ -1,5 +1,5 @@
 """
-Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
+Copyright © 2026 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
 """
 
 import time
@@ -140,8 +140,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, auto_unfreeze=False, 
-              turnoff_cell_loss=False, only_cell_loss=False, two_tail=False, 
-              cell_loss_coeff=1, org_loss_coeff=1, **kwargs):
+              keep_encoder_frozen=False, turnoff_cell_loss=False, only_cell_loss=False, 
+              two_tail=False, cell_loss_coeff=1, org_loss_coeff=1, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -173,8 +173,11 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     elif only_cell_loss:
         train_logger.info(">>> [ABLATION MODE] Organelle Loss is turned OFF. Training Cells only.")
 
+    # =================================================================
+    # PARAMETER FREEZE LOGIC
+    # =================================================================
     is_frozen = False
-    if auto_unfreeze:
+    if auto_unfreeze and not keep_encoder_frozen:
         is_frozen = True
         train_logger.info("\n>>> [MODELS] Phase 1: Freezing ViT Backbone. Training Deep Dual Branches Only.")
         for name, param in net.named_parameters():
@@ -182,12 +185,21 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 param.requires_grad = True
             else:
                 param.requires_grad = False
+    elif keep_encoder_frozen:
+        train_logger.info("\n>>> [MODELS] `keep_encoder_frozen` is True: Encoder and cell_predict head will remain PERMANENTLY frozen.")
+        for name, param in net.named_parameters():
+            # Strictly allow ONLY the training heads to receive gradients
+            if any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out']):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
     else:
         train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End.")
-        # Only unfrozen components (which respects your permanently frozen cell_predict head)
         for name, param in net.named_parameters(): 
             if 'cell_predict' not in name:
                 param.requires_grad = True
+            else:
+                param.requires_grad = False # Explicitly ensure cell_predict is ALWAYS frozen
 
     # Safely construct the optimizer with ONLY parameters that require gradients
     trainable_params = filter(lambda p: p.requires_grad, net.parameters())
@@ -239,24 +251,111 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 outputs, style = net(X) 
                 y_cell, y_org = outputs
                 
-                # ... (Debug Telemetry & Visualization blocks remain unchanged) ...
+                # ==========================================================
+                # TRAINING PIPELINE SYSTEM & TENSOR TELEMETRY 
+                # ==========================================================
+                if debug and k == 0:
+                    train_logger.info(f"\n[DEBUG-SYS] --- EPOCH {iepoch} TENSOR & HARDWARE TELEMETRY ---")
+                    
+                    vram_alloc = torch.cuda.memory_allocated(device) / 1e9
+                    vram_reserv = torch.cuda.memory_reserved(device) / 1e9
+                    train_logger.info(f"[DEBUG-SYS] VRAM Usage -> Allocated: {vram_alloc:.2f} GB | Reserved: {vram_reserv:.2f} GB")
+                    
+                    train_logger.info(f"[DEBUG-SYS] Input Batch Shape: {X.shape} | Min: {X.min().item():.3f} | Max: {X.max().item():.3f} | Mean: {X.mean().item():.3f}")
+                    
+                    n_trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+                    train_logger.info(f"[DEBUG-SYS] Trainable Params this step: {n_trainable:,}")
+
+                    y_c_np = (y_cell[0, -1] > 0.0).detach().cpu().numpy()
+                    y_o_np = (y_org[0, -1] > 0.0).detach().cpu().numpy()
+                    pred_cell_blobs = scipy.ndimage.label(y_c_np)[1]
+                    pred_org_blobs = scipy.ndimage.label(y_o_np)[1]
+                    train_logger.info(f"[DEBUG-SYS] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
+
+                    # EXPANDED CROP-LEVEL VISUALIZATION BLOCK (2x3 Grid)
+                    try:
+                        fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+                        img_c = imgi[0, 0] 
+                        img_o = imgi[0, 3] if two_tail else imgi[0, 1] 
+                        
+                        gt_c = lbl_c_aug[0, 0] > 0
+                        gt_o = lbl_o_aug[0, 0] > 0
+                        
+                        # Extract Raw Probabilities (Sigmoid) and Flows
+                        cell_prob_map = torch.sigmoid(y_cell[0, -1]).detach().cpu().numpy()
+                        org_prob_map = torch.sigmoid(y_org[0, -1]).detach().cpu().numpy()
+                        
+                        # Normalize flows purely for visualization (-5 to 5 mapped to 0 to 1)
+                        c_flow_vis = np.clip((y_cell[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
+                        o_flow_vis = np.clip((y_org[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
+                        
+                        # Pad with a blank blue channel for RGB visualization
+                        c_flow_rgb = np.concatenate([c_flow_vis, np.zeros_like(c_flow_vis[..., :1])], axis=-1)
+                        o_flow_rgb = np.concatenate([o_flow_vis, np.zeros_like(o_flow_vis[..., :1])], axis=-1)
+
+                        # --- ROW 1: CELLS ---
+                        axes[0, 0].imshow(img_c, cmap='gray')
+                        if np.any(gt_c): axes[0, 0].contour(gt_c, colors='lime', linewidths=1.0)
+                        if np.any(y_c_np): axes[0, 0].contour(y_c_np, colors='red', linewidths=1.0, linestyles='dashed')
+                        axes[0, 0].set_title("Cells: Overlays")
+                        axes[0, 0].axis('off')
+                        
+                        im_prob_c = axes[0, 1].imshow(cell_prob_map, cmap='magma', vmin=0, vmax=1)
+                        axes[0, 1].set_title("Cells: Probability Map")
+                        axes[0, 1].axis('off')
+                        fig.colorbar(im_prob_c, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+                        axes[0, 2].imshow(c_flow_rgb)
+                        axes[0, 2].set_title("Cells: Flow Vectors")
+                        axes[0, 2].axis('off')
+
+                        # --- ROW 2: ORGANELLES ---
+                        axes[1, 0].imshow(img_o, cmap='gray')
+                        if np.any(gt_o): axes[1, 0].contour(gt_o, colors='lime', linewidths=1.0)
+                        if np.any(y_o_np): axes[1, 0].contour(y_o_np, colors='red', linewidths=1.0, linestyles='dashed')
+                        axes[1, 0].set_title("Orgs: Overlays")
+                        axes[1, 0].axis('off')
+                        
+                        im_prob_o = axes[1, 1].imshow(org_prob_map, cmap='magma', vmin=0, vmax=1)
+                        axes[1, 1].set_title("Orgs: Probability Map")
+                        axes[1, 1].axis('off')
+                        fig.colorbar(im_prob_o, ax=axes[1, 1], fraction=0.046, pad=0.04)
+
+                        axes[1, 2].imshow(o_flow_rgb)
+                        axes[1, 2].set_title("Orgs: Flow Vectors")
+                        axes[1, 2].axis('off')
+                        
+                        plt.tight_layout()
+                        plt.savefig(save_path / f"debug_training_crop_epoch_{iepoch:04d}.png")
+                        plt.close(fig)
+                    except Exception as e:
+                        train_logger.warning(f"Debug plotting failed: {e}")
 
                 if only_cell_loss:
                     loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
                     loss = loss_cell / accumulation_steps
+                    if debug and k == 0:
+                        train_logger.info(f"[DEBUG-LOSS] CELL ONLY -> Total: {loss_cell.item():.4f} | Prob (BCE+Dice): {l_prob_c.item():.4f} | Flow: {l_flow_c.item():.4f} | TV: {l_tv_c.item():.4f}")
                 elif turnoff_cell_loss:
                     loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
                     loss = loss_org / accumulation_steps
+                    if debug and k == 0:
+                        train_logger.info(f"[DEBUG-LOSS] ORG ONLY -> Total: {loss_org.item():.4f} | Prob: {l_prob_o.item():.4f} | Flow: {l_flow_o.item():.4f}")
                 else:
                     loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
                     loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
                     loss = (cell_loss_coeff*loss_cell + org_loss_coeff*loss_org) / accumulation_steps
+                    if debug and k == 0:
+                        train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell [Total:{loss_cell.item():.4f}, Prob:{l_prob_c.item():.4f}, Flow:{l_flow_c.item():.4f}] | Org [Total:{loss_org.item():.4f}]")
+
 
             scaler.scale(loss).backward()
             
             if (k // batch_size + 1) % accumulation_steps == 0 or (k + batch_size) >= nimg:
                 scaler.unscale_(optimizer)
                 total_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+                if debug and k == 0:
+                    train_logger.info(f"[DEBUG-SYS] Raw Gradient Norm (Before Clip): {total_norm.item():.4f}")
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -268,20 +367,27 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
         train_losses[iepoch] /= nimg
 
+        # =================================================================
+        # AUTO-UNFREEZE TRIGGER
+        # =================================================================
         if auto_unfreeze and is_frozen and iepoch >= 8:
-            train_logger.info(f"\n>>> [AUTO-UNFREEZE] 50% Milestone Reached ({iepoch}/{n_epochs}). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
-            
-            newly_unfrozen_params = []
-            for name, param in net.named_parameters(): 
-                # Keep the cascaded head strictly frozen
-                if not param.requires_grad and 'cell_predict' not in name:
-                    param.requires_grad = True
-                    newly_unfrozen_params.append(param)
-            
-            if newly_unfrozen_params:
-                optimizer.add_param_group({'params': newly_unfrozen_params, 'lr': LR[iepoch], 'weight_decay': weight_decay})
+            if keep_encoder_frozen:
+                train_logger.info(f"\n>>> [AUTO-UNFREEZE] Skipped milestone. `keep_encoder_frozen` is True.")
+                is_frozen = False # Set to false so it doesn't keep triggering this block
+            else:
+                train_logger.info(f"\n>>> [AUTO-UNFREEZE] 50% Milestone Reached ({iepoch}/{n_epochs}). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
                 
-            is_frozen = False
+                newly_unfrozen_params = []
+                for name, param in net.named_parameters(): 
+                    # Keep the cascaded head strictly frozen
+                    if not param.requires_grad and 'cell_predict' not in name:
+                        param.requires_grad = True
+                        newly_unfrozen_params.append(param)
+                
+                if newly_unfrozen_params:
+                    optimizer.add_param_group({'params': newly_unfrozen_params, 'lr': LR[iepoch], 'weight_decay': weight_decay})
+                    
+                is_frozen = False
 
         if iepoch == 5 or iepoch % 10 == 0:
             lavgt = 0.
@@ -333,7 +439,81 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         train_logger.info(f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s")
         lavg, nsum = 0, 0
 
-        # ... (Full Image Post-Processing block remains unchanged) ...
+        # =====================================================================
+        # FULL IMAGE POST-PROCESSING EVALUATION & VISUALIZATION
+        # =====================================================================
+        if debug and test_data:
+            temp_model_path = str(filename) + f"_eval_temp"
+            net.save_model(temp_model_path)
+            eval_model = model2.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
+            
+            masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
+            pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
+            gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
+            
+            n_cells_pred = pred_cells[0].max() if np.any(pred_cells[0]) else 0
+            n_orgs_pred = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
+            n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
+            n_orgs_gt = gt_orgs[0].max() if np.any(gt_orgs[0]) else 0
+            
+            train_logger.info(f"--- [DEBUG] Full Image Counts -> CELLS: Pred {n_cells_pred} (GT {n_cells_gt}) | ORGS: Pred {n_orgs_pred} (GT {n_orgs_gt}) ---")
+            
+            def calc_metrics(gt_masks, pred_masks):
+                tp = fp = fn = 0
+                for gt, pred in zip(gt_masks, pred_masks):
+                    gt_bin, pred_bin = gt > 0, pred > 0
+                    tp += np.logical_and(gt_bin, pred_bin).sum()
+                    fp += np.logical_and(~gt_bin, pred_bin).sum()
+                    fn += np.logical_and(gt_bin, ~pred_bin).sum()  
+                return tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
+            
+            train_logger.info(f"--- [DEBUG] Test IOU -> CELLS: {calc_metrics(gt_cells, pred_cells):.4f} | ORGANELLES: {calc_metrics(gt_orgs, pred_orgs):.4f} ---")
+
+            if visualize:
+                try:
+                    fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+                    fig.suptitle(f"Epoch {iepoch} - Post-Processed Mask Reconstructions", fontsize=18, y=0.98)
+                    
+                    img_disp = test_data[0].copy()
+                    if img_disp.ndim == 3 and img_disp.shape[0] in [2, 3, 6]:
+                        img_disp = img_disp.transpose(1, 2, 0)
+                    
+                    if img_disp.max() > img_disp.min(): 
+                        img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
+                    
+                    img_cell = img_disp[..., 0] 
+                    img_org = img_disp[..., 3] if two_tail else (img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0])
+                    
+                    axes[0, 0].imshow(img_cell, cmap='gray')
+                    if np.any(gt_cells[0]): axes[0, 0].contour(gt_cells[0] > 0, colors='lime', linewidths=1.2)
+                    axes[0, 0].set_title(f"Cells - Actual GT ({n_cells_gt} masks)", fontsize=12)
+                    axes[0, 0].axis('off')
+                    
+                    axes[0, 1].imshow(img_cell, cmap='gray')
+                    if np.any(pred_cells[0]): axes[0, 1].contour(pred_cells[0] > 0, colors='red', linewidths=1.2)
+                    axes[0, 1].set_title(f"Cells - Predicted Reconstructed ({n_cells_pred} masks)", fontsize=12)
+                    axes[0, 1].axis('off')
+                    
+                    axes[1, 0].imshow(img_org, cmap='gray')
+                    if np.any(gt_orgs[0]): axes[1, 0].contour(gt_orgs[0] > 0, colors='lime', linewidths=1.2)
+                    axes[1, 0].set_title(f"Organelles - Actual GT ({n_orgs_gt} masks)", fontsize=12)
+                    axes[1, 0].axis('off')
+                    
+                    axes[1, 1].imshow(img_org, cmap='gray')
+                    if np.any(pred_orgs[0]): axes[1, 1].contour(pred_orgs[0] > 0, colors='red', linewidths=1.2)
+                    axes[1, 1].set_title(f"Organelles - Predicted Reconstructed ({n_orgs_pred} masks)", fontsize=12)
+                    axes[1, 1].axis('off')
+                    
+                    plt.tight_layout()
+                    vis_save_path = save_path / f"epoch_{iepoch:04d}_post_processed_overlay.png"
+                    plt.savefig(vis_save_path, bbox_inches='tight', dpi=150)
+                    plt.close(fig)
+                    train_logger.info(f"[DEBUG] Post-processing visualization overlay written to: {vis_save_path}")
+                except Exception as e:
+                    train_logger.warning(f"Post-processed overlay execution block errored: {e}")
+            
+            del eval_model
+            torch.cuda.empty_cache()
 
     # Final safeguard save
     net.save_model(str(filename))
