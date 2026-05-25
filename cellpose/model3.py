@@ -126,8 +126,8 @@ class DualPathTransformer(nn.Module):
         self.to(new_dtype)
 
     def load_model(self, path, device):
-        self.load_state_dict(torch.load(path, map_location=device, weights_only=True))
-
+        """ Safe hook for train.py to load the weights """
+        self.load_state_dict(torch.load(path, map_location=device, weights_only=True), strict=False)
     def save_model(self, path):
         torch.save(self.state_dict(), path)
 
