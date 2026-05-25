@@ -352,7 +352,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
         train_losses[iepoch] /= nimg
 
-        if auto_unfreeze and is_frozen and iepoch >= (n_epochs // 2):
+        if auto_unfreeze and is_frozen and iepoch >= 8:
             train_logger.info(f"\n>>> [AUTO-UNFREEZE] 50% Milestone Reached ({iepoch}/{n_epochs}). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
             
             newly_unfrozen_params = []
