@@ -7,7 +7,7 @@ import os
 import numpy as np
 import scipy.ndimage
 import matplotlib.pyplot as plt  
-from cellpose import io, utils, dynamics
+from cellpose import io, utils, dynamics, model3
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
@@ -16,7 +16,7 @@ import logging
 from huggingface_hub import HfApi
 
 # Ensure we are pulling your exact 3-head architecture
-import model6 
+
 
 train_logger = logging.getLogger(__name__)
 
