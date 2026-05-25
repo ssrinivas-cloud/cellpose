@@ -22,15 +22,14 @@ def _loss_fn_class(lbl, y, class_weights=None):
     loss3 = criterion3(y[:, :-3], lbl[:, 0].long())
     return loss3
 
-# ---> UPDATED: TOTAL VARIATION LOSS FOR CELL SMOOTHING <---
+# ---> TOTAL VARIATION LOSS FOR CELL SMOOTHING <---
 def total_variation_loss(pred_flows):
     # Penalizes the cell head if neighboring pixels point in wildly different directions
     diff_h = torch.abs(pred_flows[:, :, :, 1:] - pred_flows[:, :, :, :-1])
     diff_v = torch.abs(pred_flows[:, :, 1:, :] - pred_flows[:, :, :-1, :])
     return diff_h.mean() + diff_v.mean()
 
-# ---> UPDATED: Returning distinct loss components for debugging <---
-# ---> UPDATED: Forcing the network to find ALL cells <---
+# ---> REBALANCED CELL LOSS: Punish missing cells, forgive messy flows <---
 def _loss_fn_seg(lbl, y, device, flow_weight=0.5, prob_weight=2.0, tv_weight=0.005):
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
@@ -45,13 +44,13 @@ def _loss_fn_seg(lbl, y, device, flow_weight=0.5, prob_weight=2.0, tv_weight=0.0
     # 2. Calculate the smoothness penalty
     loss_tv = total_variation_loss(pred_flows)
     
-    # 3. REBALANCE: Punish missing foreground (prob_weight=2.0)
-    # Be more forgiving on messy vectors (flow_weight=0.5)
+    # 3. Rebalance and combine
     total_loss = (loss_prob * prob_weight) + (loss_flow * flow_weight) + (loss_tv * tv_weight)
     
+    # Return all pieces so the logger can expose them
     return total_loss, loss_prob, loss_flow, loss_tv
 
-# ---> UPDATED: Returning distinct loss components for organelles <---
+# --- STANDARD ORGANELLE LOSS (UNCHANGED) ---
 def _loss_fn_org(lbl, y, device):
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
@@ -61,7 +60,7 @@ def _loss_fn_org(lbl, y, device):
     loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
     
     total_loss = loss + loss2
-    return total_loss, loss2, loss, torch.tensor(0.0, device=device) # TV is 0 for orgs here
+    return total_loss, loss2, loss, torch.tensor(0.0, device=device)
 
 def _get_batch(inds, data=None, labels_c=None, labels_o=None, two_tail=False):
     imgs = []
@@ -240,26 +239,64 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     pred_org_blobs = scipy.ndimage.label(y_o_np)[1]
                     train_logger.info(f"[DEBUG-SYS] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
 
-                    # 4. RESTORED CROP-LEVEL VISUALIZATION BLOCK 
+                    # 4. EXPANDED CROP-LEVEL VISUALIZATION BLOCK (2x3 Grid)
                     try:
-                        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+                        fig, axes = plt.subplots(2, 3, figsize=(16, 10))
                         img_c = imgi[0, 0] 
                         img_o = imgi[0, 3] if two_tail else imgi[0, 1] 
                         
                         gt_c = lbl_c_aug[0, 0] > 0
                         gt_o = lbl_o_aug[0, 0] > 0
                         
-                        axes[0].imshow(img_c, cmap='gray')
-                        if np.any(gt_c): axes[0].contour(gt_c, colors='lime', linewidths=1.0)
-                        if np.any(y_c_np): axes[0].contour(y_c_np, colors='red', linewidths=1.0, linestyles='dashed')
-                        axes[0].set_title(f"Cells (GT: Lime, Pred: Red)")
-                        axes[0].axis('off')
+                        # Extract Raw Probabilities (Sigmoid) and Flows
+                        cell_prob_map = torch.sigmoid(y_cell[0, -1]).detach().cpu().numpy()
+                        org_prob_map = torch.sigmoid(y_org[0, -1]).detach().cpu().numpy()
                         
-                        axes[1].imshow(img_o, cmap='gray')
-                        if np.any(gt_o): axes[1].contour(gt_o, colors='lime', linewidths=1.0)
-                        if np.any(y_o_np): axes[1].contour(y_o_np, colors='red', linewidths=1.0, linestyles='dashed')
-                        axes[1].set_title(f"Organelles (GT: Lime, Pred: Red)")
-                        axes[1].axis('off')
+                        # Normalize flows purely for visualization (-5 to 5 mapped to 0 to 1)
+                        c_flow_vis = np.clip((y_cell[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
+                        o_flow_vis = np.clip((y_org[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
+                        
+                        # Pad with a blank blue channel for RGB visualization
+                        c_flow_rgb = np.concatenate([c_flow_vis, np.zeros_like(c_flow_vis[..., :1])], axis=-1)
+                        o_flow_rgb = np.concatenate([o_flow_vis, np.zeros_like(o_flow_vis[..., :1])], axis=-1)
+
+                        # --- ROW 1: CELLS ---
+                        # 1A: Overlay
+                        axes[0, 0].imshow(img_c, cmap='gray')
+                        if np.any(gt_c): axes[0, 0].contour(gt_c, colors='lime', linewidths=1.0)
+                        if np.any(y_c_np): axes[0, 0].contour(y_c_np, colors='red', linewidths=1.0, linestyles='dashed')
+                        axes[0, 0].set_title("Cells: Overlays")
+                        axes[0, 0].axis('off')
+                        
+                        # 1B: Probability Heatmap
+                        im_prob_c = axes[0, 1].imshow(cell_prob_map, cmap='magma', vmin=0, vmax=1)
+                        axes[0, 1].set_title("Cells: Probability Map")
+                        axes[0, 1].axis('off')
+                        fig.colorbar(im_prob_c, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+                        # 1C: Flow Vectors
+                        axes[0, 2].imshow(c_flow_rgb)
+                        axes[0, 2].set_title("Cells: Flow Vectors")
+                        axes[0, 2].axis('off')
+
+                        # --- ROW 2: ORGANELLES ---
+                        # 2A: Overlay
+                        axes[1, 0].imshow(img_o, cmap='gray')
+                        if np.any(gt_o): axes[1, 0].contour(gt_o, colors='lime', linewidths=1.0)
+                        if np.any(y_o_np): axes[1, 0].contour(y_o_np, colors='red', linewidths=1.0, linestyles='dashed')
+                        axes[1, 0].set_title("Orgs: Overlays")
+                        axes[1, 0].axis('off')
+                        
+                        # 2B: Probability Heatmap
+                        im_prob_o = axes[1, 1].imshow(org_prob_map, cmap='magma', vmin=0, vmax=1)
+                        axes[1, 1].set_title("Orgs: Probability Map")
+                        axes[1, 1].axis('off')
+                        fig.colorbar(im_prob_o, ax=axes[1, 1], fraction=0.046, pad=0.04)
+
+                        # 2C: Flow Vectors
+                        axes[1, 2].imshow(o_flow_rgb)
+                        axes[1, 2].set_title("Orgs: Flow Vectors")
+                        axes[1, 2].axis('off')
                         
                         plt.tight_layout()
                         plt.savefig(save_path / f"debug_training_crop_epoch_{iepoch:04d}.png")
@@ -306,7 +343,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
         train_losses[iepoch] /= nimg
 
-        # ---> UPDATED: PREVENT OPTIMIZER MOMENTUM WIPE DURING UNFREEZE <---
+        # ---> PREVENT OPTIMIZER MOMENTUM WIPE DURING UNFREEZE <---
         if auto_unfreeze and is_frozen and iepoch >= (n_epochs // 2):
             train_logger.info(f"\n>>> [AUTO-UNFREEZE] 50% Milestone Reached ({iepoch}/{n_epochs}). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
             
@@ -345,7 +382,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                             outputs, style = net(X) 
                             y_cell, y_org = outputs
                             
-                            # ---> DYNAMIC LOSS TOGGLE (EVALUATION) <---
                             if only_cell_loss:
                                 loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
                                 loss = loss_c
