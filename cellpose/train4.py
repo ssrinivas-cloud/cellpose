@@ -6,7 +6,7 @@ import time
 import os
 import numpy as np
 import scipy.ndimage
-import matplotlib.pyplot as plt  # Added to top-level imports for clean execution
+import matplotlib.pyplot as plt  
 from cellpose import io, utils, model2, dynamics
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
@@ -29,7 +29,7 @@ def total_variation_loss(pred_flows):
     diff_v = torch.abs(pred_flows[:, :, 1:, :] - pred_flows[:, :, :-1, :])
     return diff_h.mean() + diff_v.mean()
 
-# ---> UPDATED: REBALANCED CELL LOSS <---
+# ---> UPDATED: Returning distinct loss components for debugging <---
 def _loss_fn_seg(lbl, y, device, flow_weight=1.0, tv_weight=0.005):
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
@@ -44,13 +44,13 @@ def _loss_fn_seg(lbl, y, device, flow_weight=1.0, tv_weight=0.005):
     # 2. Calculate the smoothness penalty
     loss_tv = total_variation_loss(pred_flows)
     
-    # 3. Rebalance: Prioritize finding the cell foreground (prob) 
-    # Force the flows to be smooth and unified (tv)
-    # Stop heavily penalizing chaotic flow vectors (flow_weight = 0.1)
+    # 3. Rebalance and combine
     total_loss = loss_prob + (loss_flow * flow_weight) + (loss_tv * tv_weight)
-    return total_loss
+    
+    # Return all pieces so the logger can expose them
+    return total_loss, loss_prob, loss_flow, loss_tv
 
-# --- STANDARD ORGANELLE LOSS (UNCHANGED) ---
+# ---> UPDATED: Returning distinct loss components for organelles <---
 def _loss_fn_org(lbl, y, device):
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
@@ -58,7 +58,9 @@ def _loss_fn_org(lbl, y, device):
     loss = criterion(y[:, -3:-1], veci)
     loss /= 2. 
     loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
-    return loss + loss2
+    
+    total_loss = loss + loss2
+    return total_loss, loss2, loss, torch.tensor(0.0, device=device) # TV is 0 for orgs here
 
 def _get_batch(inds, data=None, labels_c=None, labels_o=None, two_tail=False):
     imgs = []
@@ -185,7 +187,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
-    best_loss, patience_counter, plateau_patience = float('inf'), 0, 5
     
     for iepoch in range(n_epochs):
         rperm = np.random.permutation(nimg)
@@ -215,17 +216,30 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 y_cell, y_org = outputs
                 
                 # ==========================================================
-                # TRAINING PIPELINE DEBUG VISUALIZATION (CROP LEVEL)
+                # TRAINING PIPELINE SYSTEM & TENSOR TELEMETRY 
                 # ==========================================================
                 if debug and k == 0:
+                    train_logger.info(f"\n[DEBUG-SYS] --- EPOCH {iepoch} TENSOR & HARDWARE TELEMETRY ---")
+                    
+                    # 1. Hardware Metrics
+                    vram_alloc = torch.cuda.memory_allocated(device) / 1e9
+                    vram_reserv = torch.cuda.memory_reserved(device) / 1e9
+                    train_logger.info(f"[DEBUG-SYS] VRAM Usage -> Allocated: {vram_alloc:.2f} GB | Reserved: {vram_reserv:.2f} GB")
+                    
+                    # 2. Tensor Statistics
+                    train_logger.info(f"[DEBUG-SYS] Input Batch Shape: {X.shape} | Min: {X.min().item():.3f} | Max: {X.max().item():.3f} | Mean: {X.mean().item():.3f}")
+                    
+                    # 3. Model Structure
+                    n_trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+                    train_logger.info(f"[DEBUG-SYS] Trainable Params this step: {n_trainable:,}")
+
                     y_c_np = (y_cell[0, -1] > 0.0).detach().cpu().numpy()
                     y_o_np = (y_org[0, -1] > 0.0).detach().cpu().numpy()
                     pred_cell_blobs = scipy.ndimage.label(y_c_np)[1]
                     pred_org_blobs = scipy.ndimage.label(y_o_np)[1]
-                    
-                    train_logger.info(f"\n[DEBUG] --- EPOCH {iepoch} BATCH 0 ---")
-                    train_logger.info(f"[DEBUG] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
+                    train_logger.info(f"[DEBUG-SYS] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
 
+                    # 4. RESTORED CROP-LEVEL VISUALIZATION BLOCK 
                     try:
                         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
                         img_c = imgi[0, 0] 
@@ -251,24 +265,35 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         plt.close(fig)
                     except Exception as e:
                         train_logger.warning(f"Debug plotting failed: {e}")
-                
-                # ---> DYNAMIC LOSS TOGGLE (TRAINING) <---
+
+                # ---> DYNAMIC LOSS TOGGLE WITH COMPONENT EXTRACTION <---
                 if only_cell_loss:
-                    loss_cell = _loss_fn_seg(L_c, y_cell, device)
+                    loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
                     loss = loss_cell / accumulation_steps
+                    if debug and k == 0:
+                        train_logger.info(f"[DEBUG-LOSS] CELL ONLY -> Total: {loss_cell.item():.4f} | Prob: {l_prob_c.item():.4f} | Flow: {l_flow_c.item():.4f} | TV: {l_tv_c.item():.4f}")
                 elif turnoff_cell_loss:
-                    loss_org = _loss_fn_org(L_o, y_org, device) 
+                    loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
                     loss = loss_org / accumulation_steps
+                    if debug and k == 0:
+                        train_logger.info(f"[DEBUG-LOSS] ORG ONLY -> Total: {loss_org.item():.4f} | Prob: {l_prob_o.item():.4f} | Flow: {l_flow_o.item():.4f}")
                 else:
-                    loss_cell = _loss_fn_seg(L_c, y_cell, device)
-                    loss_org = _loss_fn_org(L_o, y_org, device) 
+                    loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
+                    loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
                     loss = (cell_loss_coeff*loss_cell + org_loss_coeff*loss_org) / accumulation_steps
+                    if debug and k == 0:
+                        train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell [Total:{loss_cell.item():.4f}, Prob:{l_prob_c.item():.4f}, Flow:{l_flow_c.item():.4f}] | Org [Total:{loss_org.item():.4f}]")
 
             scaler.scale(loss).backward()
             
             if (k // batch_size + 1) % accumulation_steps == 0 or (k + batch_size) >= nimg:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+                
+                # ---> GRADIENT NORM TELEMETRY <---
+                total_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+                if debug and k == 0:
+                    train_logger.info(f"[DEBUG-SYS] Raw Gradient Norm (Before Clip): {total_norm.item():.4f}")
+                
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -321,14 +346,14 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                             
                             # ---> DYNAMIC LOSS TOGGLE (EVALUATION) <---
                             if only_cell_loss:
-                                loss_c = _loss_fn_seg(L_c, y_cell, device)
+                                loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
                                 loss = loss_c
                             elif turnoff_cell_loss:
-                                loss_o = _loss_fn_org(L_o, y_org, device) 
+                                loss_o, _, _, _ = _loss_fn_org(L_o, y_org, device) 
                                 loss = loss_o
                             else:
-                                loss_c = _loss_fn_seg(L_c, y_cell, device)
-                                loss_o = _loss_fn_org(L_o, y_org, device) 
+                                loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
+                                loss_o, _, _, _ = _loss_fn_org(L_o, y_org, device) 
                                 loss = cell_loss_coeff*loss_c + org_loss_coeff*loss_o
                         
                         lavgt += loss.item() * len(imgi)
@@ -345,16 +370,12 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         if debug and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
-            
-            # Instantiate evaluation model exactly matching the float32 state weights
             eval_model = model2.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
             
-            # Compute full post-processed instance mask reconstructions via dynamics step
             masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
             gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
             
-            # Extract final instance metrics
             n_cells_pred = pred_cells[0].max() if np.any(pred_cells[0]) else 0
             n_orgs_pred = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
             n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
@@ -373,48 +394,38 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
             train_logger.info(f"--- [DEBUG] Test IOU -> CELLS: {calc_metrics(gt_cells, pred_cells):.4f} | ORGANELLES: {calc_metrics(gt_orgs, pred_orgs):.4f} ---")
 
-            # ---> UPDATED POST-PROCESSING OVERLAY VISUALIZATION <---
             if visualize:
                 try:
                     fig, axes = plt.subplots(2, 2, figsize=(16, 16))
                     fig.suptitle(f"Epoch {iepoch} - Post-Processed Mask Reconstructions", fontsize=18, y=0.98)
                     
                     img_disp = test_data[0].copy()
-                    # Reconstruct spatial dimensions for plotting frameworks (H, W, C)
                     if img_disp.ndim == 3 and img_disp.shape[0] in [2, 3, 6]:
                         img_disp = img_disp.transpose(1, 2, 0)
                     
-                    # Normalize pixels dynamically to secure clean contours without dynamic clipping artifacts
                     if img_disp.max() > img_disp.min(): 
                         img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
                     
-                    # Extract backgrounds depending on dynamic pipeline structures
                     img_cell = img_disp[..., 0] 
                     img_org = img_disp[..., 3] if two_tail else (img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0])
                     
-                    # --- ROW 1: CELLS ---
                     axes[0, 0].imshow(img_cell, cmap='gray')
-                    if np.any(gt_cells[0]): 
-                        axes[0, 0].contour(gt_cells[0] > 0, colors='lime', linewidths=1.2)
+                    if np.any(gt_cells[0]): axes[0, 0].contour(gt_cells[0] > 0, colors='lime', linewidths=1.2)
                     axes[0, 0].set_title(f"Cells - Actual GT ({n_cells_gt} masks)", fontsize=12)
                     axes[0, 0].axis('off')
                     
                     axes[0, 1].imshow(img_cell, cmap='gray')
-                    if np.any(pred_cells[0]): 
-                        axes[0, 1].contour(pred_cells[0] > 0, colors='red', linewidths=1.2)
+                    if np.any(pred_cells[0]): axes[0, 1].contour(pred_cells[0] > 0, colors='red', linewidths=1.2)
                     axes[0, 1].set_title(f"Cells - Predicted Reconstructed ({n_cells_pred} masks)", fontsize=12)
                     axes[0, 1].axis('off')
                     
-                    # --- ROW 2: ORGANELLES ---
                     axes[1, 0].imshow(img_org, cmap='gray')
-                    if np.any(gt_orgs[0]): 
-                        axes[1, 0].contour(gt_orgs[0] > 0, colors='lime', linewidths=1.2)
+                    if np.any(gt_orgs[0]): axes[1, 0].contour(gt_orgs[0] > 0, colors='lime', linewidths=1.2)
                     axes[1, 0].set_title(f"Organelles - Actual GT ({n_orgs_gt} masks)", fontsize=12)
                     axes[1, 0].axis('off')
                     
                     axes[1, 1].imshow(img_org, cmap='gray')
-                    if np.any(pred_orgs[0]): 
-                        axes[1, 1].contour(pred_orgs[0] > 0, colors='red', linewidths=1.2)
+                    if np.any(pred_orgs[0]): axes[1, 1].contour(pred_orgs[0] > 0, colors='red', linewidths=1.2)
                     axes[1, 1].set_title(f"Organelles - Predicted Reconstructed ({n_orgs_pred} masks)", fontsize=12)
                     axes[1, 1].axis('off')
                     
@@ -428,7 +439,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
             del eval_model
             torch.cuda.empty_cache()
-        # =====================================================================
 
     if original_net_dtype != torch.float32: net.dtype = original_net_dtype
 
