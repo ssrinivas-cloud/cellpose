@@ -12,7 +12,6 @@ from scipy.ndimage import gaussian_filter
 import gc
 import cv2
 import copy 
-import torchvision.transforms.functional as TF  # Added for Volcano Merger
 
 import logging
 
@@ -70,7 +69,7 @@ def get_user_models():
 class DualPathTransformer(nn.Module):
     """
     Wraps the ViT backbone to safely split the architecture at the Neck.
-    Handles the PixelShuffle reshape natively and incorporates the Volcano Merger.
+    Handles the PixelShuffle reshape natively.
     """
     def __init__(self, base_net, randomize_org=False, learn_volcano=True, alpha=1.0, beta=0.1):
         super().__init__()
@@ -114,11 +113,11 @@ class DualPathTransformer(nn.Module):
         if self.learn_volcano:
             self.alpha = nn.Parameter(torch.tensor([float(alpha)], dtype=self._true_dtype))
             self.beta = nn.Parameter(torch.tensor([float(beta)], dtype=self._true_dtype))
-            models_logger.info(f"Initialized Learnable Volcano Merger: alpha={alpha}, beta={beta}")
+            models_logger.info(f">>> [VOLCANO MERGER] Learnable Mode Active (alpha={alpha}, beta={beta})")
         else:
             self.register_buffer('alpha', torch.tensor([float(alpha)], dtype=self._true_dtype))
             self.register_buffer('beta', torch.tensor([float(beta)], dtype=self._true_dtype))
-            models_logger.info(f"Initialized Static Volcano Merger: alpha={alpha}, beta={beta}")
+            models_logger.info(f">>> [VOLCANO MERGER] Static Mode Locked (alpha={alpha}, beta={beta})")
 
     @property
     def device(self):
@@ -128,18 +127,22 @@ class DualPathTransformer(nn.Module):
     def dtype(self):
         return self._true_dtype
 
+    # ---> NEW FIX: Add a setter so train.py can actually change the dtype!
     @dtype.setter
     def dtype(self, new_dtype):
         self._true_dtype = new_dtype
         self.to(new_dtype)
 
     def load_model(self, path, device):
+        """ Safe hook for train.py to load the weights """
         self.load_state_dict(torch.load(path, map_location=device, weights_only=True), strict=False)
 
     def save_model(self, path):
+        """ Safe hook for train.py to save the weights """
         torch.save(self.state_dict(), path)
 
     def pixel_shuffle(self, x):
+        """ Recreates Cellpose's hidden 8x upsampling reshape (192 -> 3 channels) """
         B, C, H, W = x.shape
         out_c = C // 64 
         x = x.view(B, out_c, 8, 8, H, W)
@@ -148,14 +151,13 @@ class DualPathTransformer(nn.Module):
 
     def apply_volcano_merger(self, out_c):
         """ Dynamically blends probability gradients into the vector flows """
+        import torchvision.transforms.functional as TF
         cell_flows = out_c[:, :2, :, :]
         cell_logits = out_c[:, 2:, :, :]
         
-        # Create dome
         prob = torch.sigmoid(cell_logits)
         prob_dome = TF.gaussian_blur(prob, kernel_size=15, sigma=[3.0, 3.0])
         
-        # Calculate gradients
         grad_y = torch.zeros_like(prob_dome)
         grad_x = torch.zeros_like(prob_dome)
         
@@ -164,20 +166,22 @@ class DualPathTransformer(nn.Module):
         
         dome_flows = torch.cat([grad_y, grad_x], dim=1)
         
-        # Use abs() to ensure network doesn't accidentally invert the topology
+        # Use abs() to ensure the network doesn't accidentally invert the topology direction
         merged_flows = (torch.abs(self.alpha) * cell_flows) + (torch.abs(self.beta) * dome_flows)
         
         return torch.cat([merged_flows, cell_logits], dim=1)
 
     def forward(self, x):
+        # Safety cast to prevent mixed precision errors
         x = x.to(self._true_dtype)
         
+        # 1. Get raw ViT features [B, 1024, 32, 32]
         feat = self.base_net.encoder(x) 
         
         if self.active_head == 'cells':
             feat_c = self.cell_neck(feat)
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
-            out_c = self.apply_volcano_merger(out_c) # Apply fusion!
+            out_c = self.apply_volcano_merger(out_c) # ---> INJECT FUSION HERE <---
             style = torch.mean(feat_c, dim=(2, 3))
             return out_c, style
             
@@ -188,11 +192,13 @@ class DualPathTransformer(nn.Module):
             return out_o, style
             
         else:
+            # Cell Path
             feat_c = self.cell_neck(feat)
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
-            out_c = self.apply_volcano_merger(out_c) # Apply fusion!
+            out_c = self.apply_volcano_merger(out_c) # ---> INJECT FUSION HERE <---
             style_c = torch.mean(feat_c, dim=(2, 3))
             
+            # Organelle Path
             feat_o = self.org_neck(feat)
             out_o = self.pixel_shuffle(self.org_out(feat_o))
             style_o = torch.mean(feat_o, dim=(2, 3))
@@ -290,9 +296,13 @@ class CellposeModel():
                         bias=(layer.bias is not None)
                     )
                     with torch.no_grad():
+                        # Divide weights by 2 so adding them together doesn't blow up gradients
                         half_weight = layer.weight.clone() / 2.0
+                        
+                        # Apply to channels 0,1,2 (Cells) and 3,4,5 (Organelles)
                         new_conv.weight[:, :3, :, :] = half_weight
                         new_conv.weight[:, 3:, :, :] = half_weight
+                        
                         if layer.bias is not None:
                             new_conv.bias.copy_(layer.bias)
                             
@@ -301,7 +311,7 @@ class CellposeModel():
                     models_logger.info(f"Input {self.nchan}-channel modification complete!")
                     break
 
-        # 4. Wrap in DualPath Architecture and pass in volcano params
+        # 4. Wrap in DualPath Architecture
         if not manual or custom_weights is not None:
             models_logger.info("Injecting DualPathTransformer (Branching directly from SAM Neck)...")
             self.net = DualPathTransformer(
@@ -326,6 +336,10 @@ class CellposeModel():
         
 
     def set_freeze_backbone(self, freeze=True):
+        """
+        Dynamically freezes or unfreezes the ViT backbone.
+        The deep dual-decoder paths will ALWAYS remain unfrozen.
+        """
         self.freeze_backbone = freeze
         if freeze:
             models_logger.info("\n>>> [MODELS] FREEZING BACKBONE: Only the Dual Decoder Paths will be trained.")
@@ -334,12 +348,11 @@ class CellposeModel():
             
         for name, param in self.net.named_parameters():
             if 'cell_neck' in name or 'cell_out' in name or 'org_neck' in name or 'org_out' in name:
-                param.requires_grad = True  
-            # Make sure to keep our new alpha and beta trainable if they were initialized as such!
-            elif name == 'alpha' or name == 'beta':
-                pass 
+                param.requires_grad = True  # Deep Upsampling Paths ALWAYS train
+            elif name in ['alpha', 'beta']:
+                param.requires_grad = getattr(self.net, 'learn_volcano', False) # Check learnable toggle
             else:
-                param.requires_grad = not freeze 
+                param.requires_grad = not freeze # ViT Backbone toggles
 
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
@@ -394,16 +407,20 @@ class CellposeModel():
         ############# actual eval code ############
         raw_x = np.copy(x)
 
+        # ---> THE DYNAMIC CHANNEL EVALUATION BYPASS <---
+        # 1. Force channels to the LAST axis (H, W, C) for core.run_net
         if x.ndim == 3 and x.shape[0] in [2, 3, 6]: 
             x = x.transpose(1, 2, 0)
         if x.ndim == 4 and x.shape[1] in [2, 3, 6]: 
             x = x.transpose(0, 2, 3, 1)
         
+        # 2. Remove zero-padded 3rd channel if present
         if x.ndim == 3 and x.shape[-1] == 3 and np.max(x[..., 2]) == 0 and np.min(x[..., 2]) == 0: 
             x = x[..., :2]
         if x.ndim == 4 and x.shape[-1] == 3 and np.max(x[..., 2]) == 0 and np.min(x[..., 2]) == 0: 
             x = x[..., :2]
 
+        # 3. Dynamic Padding based on self.nchan (two_tail logic)
         if x.ndim == 3 and x.shape[-1] == 2:
             if self.nchan == 6:
                 x = np.concatenate([np.repeat(x[..., 0:1], 3, axis=-1), np.repeat(x[..., 1:2], 3, axis=-1)], axis=-1)
@@ -501,6 +518,7 @@ class CellposeModel():
 
                 img_display = raw_x.squeeze()
                 
+                # Safe transposition for 3 or 6 channel arrays
                 if img_display.ndim > 2 and img_display.shape[0] in [2, 3, 4, 6]:
                     img_display = img_display.transpose(1, 2, 0)
                     
@@ -516,11 +534,12 @@ class CellposeModel():
                 for row, head in enumerate(heads_to_process):
                     pred_mask = all_masks[row]
                     
+                    # Extract correct channel based on dynamic nchan
                     chan_idx = 0 if head == 'cells' else (3 if self.nchan == 6 else 1)
                     if img_display.ndim == 3 and img_display.shape[-1] > chan_idx:
                         img_show = img_display[..., chan_idx]
                     else:
-                        img_show = img_display[..., 0] 
+                        img_show = img_display[..., 0] # Fallback
                     
                     axes[row][0].imshow(img_show, cmap='gray')
                     title_gt = f"Original Input ({head})"
@@ -582,12 +601,14 @@ class CellposeModel():
                  anisotropy=1.0, 
                  do_3D=False,
                  active_head='cells'):
+        """ run network on image x """
         tic = time.time()
         shape = x.shape
         
         outputs = {}
         heads_to_run = ['cells', 'organelles'] if active_head == 'both' else [active_head]
 
+        # ---> THE MAGIC FIX: Loop over the heads so core.run_net is natively executed TWICE <---
         for head in heads_to_run:
             if hasattr(self.net, 'active_head'):
                 self.net.active_head = head
@@ -635,6 +656,7 @@ class CellposeModel():
                 
             outputs[head] = (dP, cellprob, styles.squeeze() if isinstance(styles, np.ndarray) else styles)
 
+        # Re-set back to original state to prevent accidental state corruption
         if hasattr(self.net, 'active_head'):
             self.net.active_head = active_head
 
@@ -643,6 +665,7 @@ class CellposeModel():
     def _compute_masks(self, shape, dP, cellprob, flow_threshold=0.4, cellprob_threshold=0.0,
                        min_size=15, max_size_fraction=0.4, niter=None,
                        do_3D=False, stitch_threshold=0.0):
+        """ compute masks from flows and cell probability """
         changed_device_from = None
         if self.device.type == "mps" and do_3D:
             self.device = torch.device("cpu")
