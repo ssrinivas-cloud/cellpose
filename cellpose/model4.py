@@ -152,6 +152,8 @@ class DualPathTransformer(nn.Module):
     def apply_volcano_merger(self, out_c):
         """ Dynamically blends probability gradients into the vector flows """
         import torchvision.transforms.functional as TF
+        import torch.nn.functional as F
+        
         cell_flows = out_c[:, :2, :, :]
         cell_logits = out_c[:, 2:, :, :]
         
@@ -168,6 +170,14 @@ class DualPathTransformer(nn.Module):
         
         # Use abs() to ensure the network doesn't accidentally invert the topology direction
         merged_flows = (torch.abs(self.alpha) * cell_flows) + (torch.abs(self.beta) * dome_flows)
+        
+        # ---> FLOW NORMALIZATION & SCALING <---
+        # 1. L2 Normalize the vectors so they strictly point to the center with length 1.0
+        norm = torch.norm(merged_flows, p=2, dim=1, keepdim=True)
+        merged_flows = merged_flows / (norm + 1e-8)
+        
+        # 2. Scale up to 5.0 (Cellpose internal standard) and fade out background using the dome probability
+        merged_flows = merged_flows * 5.0 * prob
         
         return torch.cat([merged_flows, cell_logits], dim=1)
 
