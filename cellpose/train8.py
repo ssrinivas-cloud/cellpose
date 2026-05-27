@@ -155,8 +155,9 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, 
-              unfreeze_backbone=50, test_result=10, turnoff_cell_loss=False, only_cell_loss=False, 
-              two_tail=False, cell_loss_coeff=1, org_loss_coeff=1, **kwargs):
+              unfreeze_backbone=50, test_result=10, normalize_loss=False, 
+              turnoff_cell_loss=False, only_cell_loss=False, 
+              two_tail=False, cell_loss_coeff=1.0, org_loss_coeff=1.0, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -187,6 +188,22 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         train_logger.info(">>> [ABLATION MODE] Cell Loss is turned OFF. Training Organelles only.")
     elif only_cell_loss:
         train_logger.info(">>> [ABLATION MODE] Organelle Loss is turned OFF. Training Cells only.")
+
+    # =================================================================
+    # LOSS NORMALIZATION LOGIC
+    # =================================================================
+    if normalize_loss:
+        total_coeff = cell_loss_coeff + org_loss_coeff
+        if total_coeff > 0:
+            eff_cell_coeff = cell_loss_coeff / total_coeff
+            eff_org_coeff = org_loss_coeff / total_coeff
+            train_logger.info(f">>> [LOSS NORMALIZATION] Active. Effective Multipliers -> Cells: {eff_cell_coeff:.4f} | Orgs: {eff_org_coeff:.4f}")
+        else:
+            eff_cell_coeff = 0.5
+            eff_org_coeff = 0.5
+    else:
+        eff_cell_coeff = cell_loss_coeff
+        eff_org_coeff = org_loss_coeff
 
     # =================================================================
     # PARAMETER FREEZE LOGIC (Percentage-based Unfreezing)
@@ -361,7 +378,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 else:
                     loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
                     loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
-                    loss = (cell_loss_coeff*loss_cell + org_loss_coeff*loss_org) / accumulation_steps
+                    loss = (eff_cell_coeff*loss_cell + eff_org_coeff*loss_org) / accumulation_steps
                     if debug and k == 0:
                         train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell [Total:{loss_cell.item():.4f}, Prob:{l_prob_c.item():.4f}, Flow:{l_flow_c.item():.4f}] | Org [Total:{loss_org.item():.4f}]")
 
@@ -438,7 +455,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                             else:
                                 loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
                                 loss_o, _, _, _ = _loss_fn_org(L_o, y_org, device) 
-                                loss = cell_loss_coeff*loss_c + org_loss_coeff*loss_o
+                                loss = eff_cell_coeff*loss_c + eff_org_coeff*loss_o
                         
                         lavgt += loss.item() * len(imgi)
                 lavgt /= nimg_test
