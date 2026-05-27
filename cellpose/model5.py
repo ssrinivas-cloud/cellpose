@@ -252,7 +252,7 @@ class DualPathTransformer(nn.Module):
     2. cell_predict (frozen eval anchor)
     3. organelle (trainable early-hook fusion via CrossLayerAttentionConcat -> 2x Transformer+ASPP layers)
     """
-    def __init__(self, base_net, randomize_org=False, learn_volcano=True, alpha=1.0, beta=0.1, use_aspp=False):
+    def __init__(self, base_net, randomize_org=False, learn_volvolcano=True, alpha=1.0, beta=0.1, use_aspp=False):
         super().__init__()
         self.base_net = base_net
         self._true_dtype = next(base_net.parameters()).dtype
@@ -261,9 +261,10 @@ class DualPathTransformer(nn.Module):
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         
         # ---------------------------------------------------
-        # 0. SETUP HOOKS FOR 7 TARGET LAYERS (ORGANELLE PATH)
+        # 0. SETUP HOOKS FOR 7 TARGET LAYERS (CRITICAL FIX HERE)
         # ---------------------------------------------------
-        self.target_layers = [0, 4, 8, 12, 16, 20, 24]
+        # Shifted final target layer from 24 to 23 to respect zero-indexing ceiling of ViT-Large
+        self.target_layers = [0, 4, 8, 12, 16, 20, 23]
         self.intermediate_features = {}
         
         for layer_idx in self.target_layers:
@@ -315,7 +316,7 @@ class DualPathTransformer(nn.Module):
         if self.learn_volcano:
             self.alpha = nn.Parameter(torch.tensor([float(alpha)], dtype=self._true_dtype))
             self.beta = nn.Parameter(torch.tensor([float(beta)], dtype=self._true_dtype))
-            models_logger.info(f">>> [VOLCANO MERGER] Learnable Mode Active (alpha={alpha}, beta={beta})")
+            models_logger.info(f">// [VOLCANO MERGER] Learnable Mode Active (alpha={alpha}, beta={beta})")
         else:
             self.register_buffer('alpha', torch.tensor([float(alpha)], dtype=self._true_dtype))
             self.register_buffer('beta', torch.tensor([float(beta)], dtype=self._true_dtype))
