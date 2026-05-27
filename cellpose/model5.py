@@ -252,7 +252,7 @@ class DualPathTransformer(nn.Module):
     2. cell_predict (frozen eval anchor)
     3. organelle (trainable early-hook fusion via CrossLayerAttentionConcat -> 2x Transformer+ASPP layers)
     """
-    def __init__(self, base_net, randomize_org=False, learn_volvolcano=True, alpha=1.0, beta=0.1, use_aspp=False):
+    def __init__(self, base_net, randomize_org=False, use_aspp=False):
         super().__init__()
         self.base_net = base_net
         self._true_dtype = next(base_net.parameters()).dtype
@@ -261,9 +261,8 @@ class DualPathTransformer(nn.Module):
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         
         # ---------------------------------------------------
-        # 0. SETUP HOOKS FOR 7 TARGET LAYERS (CRITICAL FIX HERE)
+        # 0. SETUP HOOKS FOR 7 TARGET LAYERS (CRITICAL CEILING FIXED TO 23)
         # ---------------------------------------------------
-        # Shifted final target layer from 24 to 23 to respect zero-indexing ceiling of ViT-Large
         self.target_layers = [0, 4, 8, 12, 16, 20, 23]
         self.intermediate_features = {}
         
@@ -311,17 +310,6 @@ class DualPathTransformer(nn.Module):
         
         self.active_head = 'both'
 
-        # ---> VOLCANO MERGER PARAMETERS <---
-        self.learn_volcano = learn_volcano
-        if self.learn_volcano:
-            self.alpha = nn.Parameter(torch.tensor([float(alpha)], dtype=self._true_dtype))
-            self.beta = nn.Parameter(torch.tensor([float(beta)], dtype=self._true_dtype))
-            models_logger.info(f">// [VOLCANO MERGER] Learnable Mode Active (alpha={alpha}, beta={beta})")
-        else:
-            self.register_buffer('alpha', torch.tensor([float(alpha)], dtype=self._true_dtype))
-            self.register_buffer('beta', torch.tensor([float(beta)], dtype=self._true_dtype))
-            models_logger.info(f">>> [VOLCANO MERGER] Static Mode Locked (alpha={alpha}, beta={beta})")
-
     def _get_hook(self, layer_idx):
         def hook(module, input, output):
             self.intermediate_features[layer_idx] = output
@@ -366,32 +354,6 @@ class DualPathTransformer(nn.Module):
         x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
         return x.view(B, out_c, H * 8, W * 8)
 
-    def apply_volcano_merger(self, out_c):
-        """ Dynamically blends probability gradients into the vector flows """
-        import torchvision.transforms.functional as TF
-        import torch.nn.functional as F
-        
-        cell_flows = out_c[:, :2, :, :]
-        cell_logits = out_c[:, 2:, :, :]
-        
-        prob = torch.sigmoid(cell_logits)
-        prob_dome = TF.gaussian_blur(prob, kernel_size=15, sigma=[3.0, 3.0])
-        
-        grad_y = torch.zeros_like(prob_dome)
-        grad_x = torch.zeros_like(prob_dome)
-        
-        grad_y[:, :, 1:-1, :] = (prob_dome[:, :, 2:, :] - prob_dome[:, :, :-2, :]) / 2.0
-        grad_x[:, :, :, 1:-1] = (prob_dome[:, :, :, 2:] - prob_dome[:, :, :, :-2]) / 2.0
-        
-        dome_flows = torch.cat([grad_y, grad_x], dim=1)
-        merged_flows = (torch.abs(self.alpha) * cell_flows) + (torch.abs(self.beta) * dome_flows)
-        
-        norm = torch.norm(merged_flows, p=2, dim=1, keepdim=True)
-        merged_flows = merged_flows / (norm + 1e-8)
-        merged_flows = merged_flows * 5.0 * prob
-        
-        return torch.cat([merged_flows, cell_logits], dim=1)
-
     def forward(self, x):
         self.intermediate_features.clear()
         x = x.to(self._true_dtype)
@@ -421,7 +383,6 @@ class DualPathTransformer(nn.Module):
             feat_c = self.cell_predict_neck(final_vit_out)
             out_c = self.pixel_shuffle(self.cell_predict_out(feat_c))
             
-        out_c = self.apply_volcano_merger(out_c) 
         style_c = torch.mean(feat_c, dim=(2, 3))
         
         # ========================================
@@ -454,7 +415,7 @@ class DualPathTransformer(nn.Module):
 class CellposeModel():
     def __init__(self, gpu=False, pretrained_model="cpsam", custom_weights=None, model_type=None,
                  diam_mean=None, device=None, nchan=None, use_bfloat16=True, manual=True, 
-                 freeze_backbone=False, random=False, learn_volcano=True, alpha=1.0, beta=0.1, ASPP=False):
+                 freeze_backbone=False, random=False, ASPP=False):
 
         if diam_mean is not None:
             models_logger.warning("diam_mean argument are not used in v4.0.1+. Ignoring this argument...")
@@ -533,20 +494,12 @@ class CellposeModel():
             self.net = DualPathTransformer(
                 base_net, 
                 randomize_org=random,
-                learn_volcano=learn_volcano,
-                alpha=alpha,
-                beta=beta,
                 use_aspp=ASPP
             ).to(self.device)
         else:
             self.net = base_net
 
         self.freeze_backbone = freeze_backbone
-
-        if custom_weights is not None and os.path.exists(custom_weights):
-            models_logger.info(f">>>> loading CUSTOM post-architectural weights {custom_weights}")
-            self.net.load_model(custom_weights, device=self.device)
-
         self.set_freeze_backbone(self.freeze_backbone)
         
 
@@ -562,8 +515,6 @@ class CellposeModel():
                 param.requires_grad = False 
             elif any(key in name for key in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention_concat', 'organelle_transformer', 'intermediate_decoder']):
                 param.requires_grad = True  
-            elif name in ['alpha', 'beta']:
-                param.requires_grad = getattr(self.net, 'learn_volcano', False)
             else:
                 param.requires_grad = not freeze
 
