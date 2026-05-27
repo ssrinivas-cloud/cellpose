@@ -1,5 +1,5 @@
 """
-Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
+Copyright © 2026 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
 """
 
 import time
@@ -7,13 +7,15 @@ import os
 import numpy as np
 import scipy.ndimage
 import matplotlib.pyplot as plt  
-from cellpose import io, utils, model2, dynamics
+from cellpose import io, utils, dynamics, model3
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
 from torch import nn
 import logging
 from huggingface_hub import HfApi
+
+# Ensure we are pulling your exact 3-head architecture
 
 train_logger = logging.getLogger(__name__)
 
@@ -28,61 +30,85 @@ def total_variation_loss(pred_flows):
     diff_v = torch.abs(pred_flows[:, :, 1:, :] - pred_flows[:, :, :-1, :])
     return diff_h.mean() + diff_v.mean()
 
-# ---> NEW: SOFT-DICE LOSS FUNCTION <---
 def dice_loss(pred_logits, target_mask, smooth=1e-5):
+    # Apply sigmoid to get probabilities (0 to 1)
     pred_probs = torch.sigmoid(pred_logits)
+    
+    # Flatten tensors
     pred_flat = pred_probs.view(-1)
     target_flat = target_mask.view(-1)
+    
+    # Calculate intersection and union
     intersection = (pred_flat * target_flat).sum()
     union = pred_flat.sum() + target_flat.sum()
+    
+    # Calculate Dice coefficient and return loss
     dice = (2. * intersection + smooth) / (union + smooth)
     return 1.0 - dice
 
-# ---> UPDATED: HYBRID BCE + DICE + FLOW + TV LOSS <---
 def _loss_fn_seg(lbl, y, device, flow_weight=0.5, bce_weight=1.0, dice_weight=2.0, tv_weight=0.005):
     criterion_mse = nn.MSELoss(reduction="mean")
     criterion_bce = nn.BCEWithLogitsLoss(reduction="mean")
     
-    veci = 5. * lbl[:, -2:] 
-    pred_flows = y[:, -3:-1] 
+    veci = 5. * lbl[:, -2:] # GT Cell Flows
+    pred_flows = y[:, -3:-1] # Predicted Cell Flows
     
     target_mask = (lbl[:, -3] > 0.5).to(y.dtype)
     pred_logits = y[:, -1]
     
+    # 1. Calculate base losses
     loss_flow = criterion_mse(pred_flows, veci)
     loss_bce = criterion_bce(pred_logits, target_mask)
     loss_dice = dice_loss(pred_logits, target_mask)
+    
+    # 2. Calculate the smoothness penalty
     loss_tv = total_variation_loss(pred_flows)
     
+    # 3. Combine: Force the model to expand shapes using Dice (dice_weight=2.0)
     loss_prob_total = (loss_bce * bce_weight) + (loss_dice * dice_weight)
     total_loss = loss_prob_total + (loss_flow * flow_weight) + (loss_tv * tv_weight)
     
     return total_loss, loss_prob_total, loss_flow, loss_tv
 
-# --- STANDARD ORGANELLE LOSS (UNCHANGED) ---
-def _loss_fn_org(lbl, y, device):
-    criterion = nn.MSELoss(reduction="mean")
-    criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
-    veci = 5. * lbl[:, -2:]
-    loss = criterion(y[:, -3:-1], veci)
-    loss /= 2. 
-    loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
+# =========================================================================
+# CRITICAL UPDATE: Organelles now use the Hybrid Dice + BCE Loss
+# =========================================================================
+def _loss_fn_org(lbl, y, device, flow_weight=0.5, bce_weight=1.0, dice_weight=2.0):
+    criterion_mse = nn.MSELoss(reduction="mean")
+    criterion_bce = nn.BCEWithLogitsLoss(reduction="mean")
     
-    total_loss = loss + loss2
-    return total_loss, loss2, loss, torch.tensor(0.0, device=device)
+    veci = 5. * lbl[:, -2:] # GT Org Flows
+    pred_flows = y[:, -3:-1] # Predicted Org Flows
+    
+    target_mask = (lbl[:, -3] > 0.5).to(y.dtype)
+    pred_logits = y[:, -1]
+    
+    # 1. Calculate base losses
+    loss_flow = criterion_mse(pred_flows, veci)
+    loss_bce = criterion_bce(pred_logits, target_mask)
+    loss_dice = dice_loss(pred_logits, target_mask)
+    
+    # 2. Combine (No TV loss needed for tiny organelles)
+    loss_prob_total = (loss_bce * bce_weight) + (loss_dice * dice_weight)
+    total_loss = loss_prob_total + (loss_flow * flow_weight)
+    
+    return total_loss, loss_prob_total, loss_flow, torch.tensor(0.0, device=device)
 
 def _get_batch(inds, data=None, labels_c=None, labels_o=None, two_tail=False):
     imgs = []
     for i in inds:
         img = data[i].copy()
         
+        # Standardize to (C, H, W)
         if img.ndim == 3 and img.shape[-1] <= 3:
             img = img.transpose(2, 0, 1)
             
+        # Detect and drop fake zero-padded 3rd channel if it was added upstream
         if img.ndim == 3 and img.shape[0] == 3:
             if np.max(img[2]) == 0.0 and np.min(img[2]) == 0.0:
                 img = img[:2]
                 
+        # ---> DYNAMIC BATCH MAPPING <---
         if img.ndim == 3 and img.shape[0] == 2:
             if two_tail:
                 img = np.concatenate([
@@ -122,15 +148,15 @@ def _process_train_test_paired(train_data, train_labels_c, train_labels_o, test_
         
     return train_flows_c, train_flows_o, test_flows_c, test_flows_o, diam_train, diam_test
 
+
 def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               test_data=None, test_labels_c=None, test_labels_o=None,
               batch_size=8, learning_rate=3e-4, n_epochs=100, weight_decay=0.0001, 
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, auto_unfreeze=False, 
-              turnoff_cell_loss=False, only_cell_loss=False, two_tail=False, 
-              cell_loss_coeff=1, org_loss_coeff=1, 
-              learn_volcano=True, alpha=1.0, beta=0.1, **kwargs):
+              keep_encoder_frozen=False, turnoff_cell_loss=False, only_cell_loss=False, 
+              two_tail=False, cell_loss_coeff=1, org_loss_coeff=1, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -162,25 +188,35 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     elif only_cell_loss:
         train_logger.info(">>> [ABLATION MODE] Organelle Loss is turned OFF. Training Cells only.")
 
+    # =================================================================
+    # PARAMETER FREEZE LOGIC (3-Head Architecture Compliant)
+    # =================================================================
     is_frozen = False
-    if auto_unfreeze:
+    if auto_unfreeze and not keep_encoder_frozen:
         is_frozen = True
         train_logger.info("\n>>> [MODELS] Phase 1: Freezing ViT Backbone. Training Deep Dual Branches Only.")
-        for name, param in net.named_parameters():
-            # ---> FIX 1: Add new Organelle Early Fusion Modules to Unfrozen list <---
-            if any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention', 'intermediate_decoder']):
-                param.requires_grad = True
-            elif name in ['alpha', 'beta']:
-                param.requires_grad = learn_volcano
-            else:
-                param.requires_grad = False
-        trainable_params = filter(lambda p: p.requires_grad, net.parameters())
-        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+    elif keep_encoder_frozen:
+        is_frozen = True
+        train_logger.info("\n>>> [MODELS] `keep_encoder_frozen` is True: Encoder and cell_predict head will remain PERMANENTLY frozen.")
     else:
         train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End.")
-        for param in net.parameters(): 
+
+    for name, param in net.named_parameters():
+        # HEAD 2: The Eval prediction head ALWAYS stays frozen
+        if any(x in name for x in ['cell_predict_neck', 'cell_predict_out']):
+            param.requires_grad = False
+        # HEAD 1 & 3: Deep branches ALWAYS train
+        elif any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention', 'intermediate_decoder']):
             param.requires_grad = True
-        optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        elif name in ['alpha', 'beta']:
+            param.requires_grad = getattr(net, 'learn_volcano', False)
+        # Backbone routing depending on freeze state
+        else:
+            param.requires_grad = not is_frozen
+
+    # Safely construct the optimizer with ONLY parameters that require gradients
+    trainable_params = filter(lambda p: p.requires_grad, net.parameters())
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
         
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
     accumulation_steps = max(1, 8 // batch_size)
@@ -194,6 +230,10 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     save_path.mkdir(exist_ok=True)
     filename = save_path / model_name
     
+    # Best Model Tracking Initialization
+    best_test_loss = float('inf')
+    best_model_path = str(filename)
+    
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
     
@@ -201,7 +241,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         rperm = np.random.permutation(nimg)
         for param_group in optimizer.param_groups: param_group["lr"] = LR[iepoch]
         
-        net.train()
+        net.train() # Switches forward pass to use cell_head
         optimizer.zero_grad()
 
         for k in range(0, nimg, batch_size):
@@ -215,7 +255,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
             imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
             lbl_c_aug, lbl_o_aug = lbl_aug[:, :3, :, :], lbl_aug[:, 3:, :, :]
-                                                                                                
+                                                                                                        
             X = torch.from_numpy(imgi).to(device)
             L_c = torch.from_numpy(lbl_c_aug).to(device)
             L_o = torch.from_numpy(lbl_o_aug).to(device)
@@ -239,15 +279,13 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     n_trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
                     train_logger.info(f"[DEBUG-SYS] Trainable Params this step: {n_trainable:,}")
 
-                    if hasattr(net, 'alpha') and hasattr(net, 'beta'):
-                        train_logger.info(f"[DEBUG-SYS] Volcano Weights -> Alpha (Flows): {net.alpha.item():.4f} | Beta (Dome): {net.beta.item():.4f}")
-
                     y_c_np = (y_cell[0, -1] > 0.0).detach().cpu().numpy()
                     y_o_np = (y_org[0, -1] > 0.0).detach().cpu().numpy()
                     pred_cell_blobs = scipy.ndimage.label(y_c_np)[1]
                     pred_org_blobs = scipy.ndimage.label(y_o_np)[1]
                     train_logger.info(f"[DEBUG-SYS] Dual-Head Prediction -> Cells: {pred_cell_blobs} | Orgs: {pred_org_blobs}")
 
+                    # EXPANDED CROP-LEVEL VISUALIZATION BLOCK (2x3 Grid)
                     try:
                         fig, axes = plt.subplots(2, 3, figsize=(16, 10))
                         img_c = imgi[0, 0] 
@@ -256,15 +294,19 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         gt_c = lbl_c_aug[0, 0] > 0
                         gt_o = lbl_o_aug[0, 0] > 0
                         
+                        # Extract Raw Probabilities (Sigmoid) and Flows
                         cell_prob_map = torch.sigmoid(y_cell[0, -1]).detach().cpu().numpy()
                         org_prob_map = torch.sigmoid(y_org[0, -1]).detach().cpu().numpy()
                         
+                        # Normalize flows purely for visualization (-5 to 5 mapped to 0 to 1)
                         c_flow_vis = np.clip((y_cell[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
                         o_flow_vis = np.clip((y_org[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
                         
+                        # Pad with a blank blue channel for RGB visualization
                         c_flow_rgb = np.concatenate([c_flow_vis, np.zeros_like(c_flow_vis[..., :1])], axis=-1)
                         o_flow_rgb = np.concatenate([o_flow_vis, np.zeros_like(o_flow_vis[..., :1])], axis=-1)
 
+                        # --- ROW 1: CELLS ---
                         axes[0, 0].imshow(img_c, cmap='gray')
                         if np.any(gt_c): axes[0, 0].contour(gt_c, colors='lime', linewidths=1.0)
                         if np.any(y_c_np): axes[0, 0].contour(y_c_np, colors='red', linewidths=1.0, linestyles='dashed')
@@ -280,6 +322,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         axes[0, 2].set_title("Cells: Flow Vectors")
                         axes[0, 2].axis('off')
 
+                        # --- ROW 2: ORGANELLES ---
                         axes[1, 0].imshow(img_o, cmap='gray')
                         if np.any(gt_o): axes[1, 0].contour(gt_o, colors='lime', linewidths=1.0)
                         if np.any(y_o_np): axes[1, 0].contour(y_o_np, colors='red', linewidths=1.0, linestyles='dashed')
@@ -318,15 +361,14 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     if debug and k == 0:
                         train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell [Total:{loss_cell.item():.4f}, Prob:{l_prob_c.item():.4f}, Flow:{l_flow_c.item():.4f}] | Org [Total:{loss_org.item():.4f}]")
 
+
             scaler.scale(loss).backward()
             
             if (k // batch_size + 1) % accumulation_steps == 0 or (k + batch_size) >= nimg:
                 scaler.unscale_(optimizer)
-                
                 total_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
                 if debug and k == 0:
                     train_logger.info(f"[DEBUG-SYS] Raw Gradient Norm (Before Clip): {total_norm.item():.4f}")
-                
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -338,19 +380,27 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
         train_losses[iepoch] /= nimg
 
-        if auto_unfreeze and is_frozen and iepoch >= 5:
-            train_logger.info(f"\n>>> [AUTO-UNFREEZE] Epoch 5 Reached. UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
-            
-            newly_unfrozen_params = []
-            for name, param in net.named_parameters(): 
-                if not param.requires_grad:
-                    param.requires_grad = True
-                    newly_unfrozen_params.append(param)
-            
-            if newly_unfrozen_params:
-                optimizer.add_param_group({'params': newly_unfrozen_params, 'lr': LR[iepoch], 'weight_decay': weight_decay})
+        # =================================================================
+        # AUTO-UNFREEZE TRIGGER
+        # =================================================================
+        if auto_unfreeze and is_frozen and iepoch >= 8:
+            if keep_encoder_frozen:
+                train_logger.info(f"\n>>> [AUTO-UNFREEZE] Skipped milestone. `keep_encoder_frozen` is True.")
+                is_frozen = False 
+            else:
+                train_logger.info(f"\n>>> [AUTO-UNFREEZE] 50% Milestone Reached ({iepoch}/{n_epochs}). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
                 
-            is_frozen = False
+                newly_unfrozen_params = []
+                for name, param in net.named_parameters(): 
+                    # Keep the eval prediction head strictly frozen
+                    if not param.requires_grad and 'cell_predict' not in name:
+                        param.requires_grad = True
+                        newly_unfrozen_params.append(param)
+                
+                if newly_unfrozen_params:
+                    optimizer.add_param_group({'params': newly_unfrozen_params, 'lr': LR[iepoch], 'weight_decay': weight_decay})
+                    
+                is_frozen = False
 
         if iepoch == 5 or iepoch % 10 == 0:
             lavgt = 0.
@@ -358,6 +408,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 rperm_test = np.random.permutation(nimg_test)
                 for ibatch in range(0, nimg_test, batch_size):
                     with torch.no_grad():
+                        # Setting to eval triggers the Two-Pass Feedback Loop in model.forward()
                         net.eval()
                         inds = rperm_test[ibatch:ibatch + batch_size]
                         imgs, lbls_c, lbls_o = _get_batch(inds, data=test_data, labels_c=test_flows_c, labels_o=test_flows_o, two_tail=two_tail)
@@ -373,6 +424,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         L_o = torch.from_numpy(lbl_o_aug).to(device)
 
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
+                            # outputs returned from cell_predict via Two-Pass feedback
                             outputs, style = net(X) 
                             y_cell, y_org = outputs
                             
@@ -391,6 +443,13 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 lavgt /= nimg_test
                 test_losses[iepoch] = lavgt
                 
+                # --- TRACK & SAVE BEST MODEL ---
+                if lavgt < best_test_loss:
+                    best_test_loss = lavgt
+                    best_model_path = str(filename) + "_best"
+                    net.save_model(best_model_path)
+                    train_logger.info(f"*** New Best Model Saved! Test Loss: {best_test_loss:.4f} ***")
+
         lavg /= nsum
         train_logger.info(f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s")
         lavg, nsum = 0, 0
@@ -401,19 +460,9 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         if debug and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
+            eval_model = model3.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
             
-            # Match eval model with the learnable Volcano Merger args
-            eval_model = model2.CellposeModel(
-                gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3),
-                learn_volcano=learn_volcano, alpha=alpha, beta=beta
-            )
-            
-            masks_both, _, _ = eval_model.eval(
-                test_data, batch_size=2, channels=[0,0], 
-                cellprob_threshold=0.0, flow_threshold=0.0, 
-                rescale=1.0, active_head='both'
-            )
-            
+            masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
             gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
             
@@ -481,11 +530,22 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             del eval_model
             torch.cuda.empty_cache()
 
+    # Final safeguard save
+    net.save_model(str(filename))
+
     if original_net_dtype != torch.float32: net.dtype = original_net_dtype
 
+    # --- HUGGING FACE BEST MODEL PUSH ---
     if hf_repo_id and hf_token:
+        train_logger.info(f">>> Uploading BEST model ({best_model_path}) to Hugging Face Hub: {hf_repo_id}")
         api = HfApi(token=hf_token)
         api.create_repo(repo_id=hf_repo_id, exist_ok=True)
-        api.upload_file(path_or_fileobj=str(filename), path_in_repo=f"models/{model_name}", repo_id=hf_repo_id, repo_type="model")
+        api.upload_file(
+            path_or_fileobj=best_model_path, 
+            path_in_repo=f"models/{model_name}_best", 
+            repo_id=hf_repo_id, 
+            repo_type="model"
+        )
+        train_logger.info(">>> Upload complete!")
 
-    return filename, train_losses, test_losses
+    return best_model_path, train_losses, test_losses
