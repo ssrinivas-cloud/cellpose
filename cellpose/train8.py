@@ -154,8 +154,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               batch_size=8, learning_rate=3e-4, n_epochs=100, weight_decay=0.0001, 
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
-              save_flows=False, visualize=False, debug=False, auto_unfreeze=False, 
-              keep_encoder_frozen=False, turnoff_cell_loss=False, only_cell_loss=False, 
+              save_flows=False, visualize=False, debug=False, 
+              unfreeze_backbone=50, turnoff_cell_loss=False, only_cell_loss=False, 
               two_tail=False, cell_loss_coeff=1, org_loss_coeff=1, **kwargs):
     
     device = net.device
@@ -189,28 +189,32 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         train_logger.info(">>> [ABLATION MODE] Organelle Loss is turned OFF. Training Cells only.")
 
     # =================================================================
-    # PARAMETER FREEZE LOGIC (3-Head Architecture Compliant)
+    # PARAMETER FREEZE LOGIC (Percentage-based Unfreezing)
     # =================================================================
-    is_frozen = False
-    if auto_unfreeze and not keep_encoder_frozen:
-        is_frozen = True
-        train_logger.info("\n>>> [MODELS] Phase 1: Freezing ViT Backbone. Training Deep Dual Branches Only.")
-    elif keep_encoder_frozen:
-        is_frozen = True
-        train_logger.info("\n>>> [MODELS] `keep_encoder_frozen` is True: Encoder and cell_predict head will remain PERMANENTLY frozen.")
+    # Clamp value safely between 0 and 100
+    unfreeze_backbone = max(0, min(100, unfreeze_backbone))
+    unfreeze_epoch = int((unfreeze_backbone / 100.0) * n_epochs)
+    
+    is_frozen = unfreeze_epoch > 0
+
+    if is_frozen:
+        if unfreeze_epoch >= n_epochs:
+            train_logger.info(f"\n>>> [MODELS] Backbone will remain PERMANENTLY frozen (unfreeze_backbone={unfreeze_backbone}%).")
+        else:
+            train_logger.info(f"\n>>> [MODELS] Phase 1: Freezing ViT Backbone. Will unfreeze at Epoch {unfreeze_epoch} ({unfreeze_backbone}%).")
     else:
-        train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End.")
+        train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End from start (unfreeze_backbone=0%).")
 
     for name, param in net.named_parameters():
         # HEAD 2: The Eval prediction head ALWAYS stays frozen
         if any(x in name for x in ['cell_predict_neck', 'cell_predict_out']):
             param.requires_grad = False
-        # HEAD 1 & 3: Deep branches ALWAYS train
-        elif any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention', 'intermediate_decoder']):
+        # HEAD 1 & 3: Deep branches and intermediate decoders ALWAYS train
+        elif any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'organelle_transformer', 'intermediate_decoder', 'layer_attention']):
             param.requires_grad = True
         elif name in ['alpha', 'beta']:
             param.requires_grad = getattr(net, 'learn_volcano', False)
-        # Backbone routing depending on freeze state
+        # Backbone routing depending on initial freeze state
         else:
             param.requires_grad = not is_frozen
 
@@ -383,24 +387,20 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         # =================================================================
         # AUTO-UNFREEZE TRIGGER
         # =================================================================
-        if auto_unfreeze and is_frozen and iepoch >= 8:
-            if keep_encoder_frozen:
-                train_logger.info(f"\n>>> [AUTO-UNFREEZE] Skipped milestone. `keep_encoder_frozen` is True.")
-                is_frozen = False 
-            else:
-                train_logger.info(f"\n>>> [AUTO-UNFREEZE] 50% Milestone Reached ({iepoch}/{n_epochs}). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
+        if is_frozen and iepoch >= unfreeze_epoch and unfreeze_epoch < n_epochs:
+            train_logger.info(f"\n>>> [AUTO-UNFREEZE] Milestone Reached (Epoch {iepoch}/{n_epochs} - {unfreeze_backbone}%). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
+            
+            newly_unfrozen_params = []
+            for name, param in net.named_parameters(): 
+                # Keep the eval prediction head strictly frozen
+                if not param.requires_grad and 'cell_predict' not in name:
+                    param.requires_grad = True
+                    newly_unfrozen_params.append(param)
+            
+            if newly_unfrozen_params:
+                optimizer.add_param_group({'params': newly_unfrozen_params, 'lr': LR[iepoch], 'weight_decay': weight_decay})
                 
-                newly_unfrozen_params = []
-                for name, param in net.named_parameters(): 
-                    # Keep the eval prediction head strictly frozen
-                    if not param.requires_grad and 'cell_predict' not in name:
-                        param.requires_grad = True
-                        newly_unfrozen_params.append(param)
-                
-                if newly_unfrozen_params:
-                    optimizer.add_param_group({'params': newly_unfrozen_params, 'lr': LR[iepoch], 'weight_decay': weight_decay})
-                    
-                is_frozen = False
+            is_frozen = False
 
         if iepoch == 5 or iepoch % 10 == 0:
             lavgt = 0.
