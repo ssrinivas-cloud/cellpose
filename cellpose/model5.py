@@ -131,8 +131,10 @@ class IntermediateDecoder(nn.Module):
 
 class DualPathTransformer(nn.Module):
     """
-    Wraps the ViT backbone to securely branch outputs. 
-    Cells draw from the final layer. Organelles draw from early layers via hooks.
+    Wraps the ViT backbone to securely branch outputs into three heads:
+    1. cell_head (trainable)
+    2. cell_predict (frozen eval anchor)
+    3. organelle (trainable early-hook fusion)
     """
     def __init__(self, base_net, randomize_org=False, learn_volcano=True, alpha=1.0, beta=0.1):
         super().__init__()
@@ -143,7 +145,7 @@ class DualPathTransformer(nn.Module):
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         
         # ---------------------------------------------------
-        # 1. SETUP HOOKS FOR EARLY LAYERS (ORGANELLE PATH)
+        # 0. SETUP HOOKS FOR EARLY LAYERS (ORGANELLE PATH)
         # ---------------------------------------------------
         self.target_layers = [4, 6, 8, 10, 12, 14]
         self.intermediate_features = {}
@@ -153,15 +155,24 @@ class DualPathTransformer(nn.Module):
                 self._get_hook(layer_idx)
             )
             
-        # ---------------------------------------------------
-        # 2. CELL PATHWAY (Uses Final Backbone Output)
-        # ---------------------------------------------------
+        # ===================================================
+        # HEAD 1: CELL HEAD (TRAINING)
+        # ===================================================
+        # Initialized with original CPSAM weights
         self.cell_neck = copy.deepcopy(base_net.encoder.neck)
         self.cell_out = copy.deepcopy(base_net.out)
         
-        # ---------------------------------------------------
-        # 3. ORGANELLE PATHWAY (Uses Hooked Outputs)
-        # ---------------------------------------------------
+        # ===================================================
+        # HEAD 2: CELL PREDICT HEAD (EVALUATION / FROZEN)
+        # ===================================================
+        # Initialized with exact same CPSAM weights
+        self.cell_predict_neck = copy.deepcopy(base_net.encoder.neck)
+        self.cell_predict_out = copy.deepcopy(base_net.out)
+        
+        # ===================================================
+        # HEAD 3: ORGANELLE HEAD
+        # ===================================================
+        # Initialized with exact same CPSAM weights
         self.layer_attention = LayerWiseAttention(embed_dim=1024, num_layers=len(self.target_layers)).to(self._true_dtype)
         self.intermediate_decoder = IntermediateDecoder(embed_dim=1024).to(self._true_dtype)
         
@@ -179,7 +190,7 @@ class DualPathTransformer(nn.Module):
                     nn.init.kaiming_normal_(m.weight)
                     if m.bias is not None: nn.init.constant_(m.bias, 0)
         
-        # Disconnect original components
+        # Disconnect original components to prevent accidental usage
         self.base_net.encoder.neck = nn.Identity()
         self.base_net.out = nn.Identity()
         
@@ -271,31 +282,52 @@ class DualPathTransformer(nn.Module):
         self.intermediate_features.clear()
         x = x.to(self._true_dtype)
         
-        # 1. Main ViT Pass (Hooks are triggered automatically here)
-        final_vit_out = self.base_net.encoder(x) 
-        
         # ========================================
-        # CELL PATHWAY
+        # CELL PATHWAY (TRAIN vs EVAL ROUTING)
         # ========================================
-        feat_c = self.cell_neck(final_vit_out)
-        out_c = self.pixel_shuffle(self.cell_out(feat_c))
+        if self.training:
+            # --- TRAINING: Single Pass via cell_head ---
+            final_vit_out = self.base_net.encoder(x) 
+            feat_c = self.cell_neck(final_vit_out)
+            out_c = self.pixel_shuffle(self.cell_out(feat_c))
+        else:
+            # --- EVALUATION: Two-Pass Feedback Loop ---
+            
+            # PASS 1: Generate Probability Map from cell_head
+            vit_out_pass1 = self.base_net.encoder(x)
+            feat_c_pass1 = self.cell_neck(vit_out_pass1)
+            out_c_pass1 = self.pixel_shuffle(self.cell_out(feat_c_pass1))
+            
+            # Extract probability map (Logits are exactly at channel 2)
+            prob_map = torch.sigmoid(out_c_pass1[:, 2:3, :, :])
+            
+            # FEEDBACK: Modulate original input with the probability map
+            # Broadcasting natively handles (B, C, H, W) * (B, 1, H, W)
+            x_feedback = x * prob_map
+            
+            # Clear hooks before the second pass so organelles use the final feedback features
+            self.intermediate_features.clear()
+            
+            # PASS 2: Feed back into the model
+            final_vit_out = self.base_net.encoder(x_feedback)
+            
+            # Predict via frozen cell_predict head
+            feat_c = self.cell_predict_neck(final_vit_out)
+            out_c = self.pixel_shuffle(self.cell_predict_out(feat_c))
+            
         out_c = self.apply_volcano_merger(out_c) 
         style_c = torch.mean(feat_c, dim=(2, 3))
         
         # ========================================
         # ORGANELLE PATHWAY
         # ========================================
-        # 1. Gather early features from hooks
+        # Gather early features from hooks
         early_features = [self.intermediate_features[i] for i in self.target_layers]
-        
-        # 2. Layer-wise Fusion
         fused_early = self.layer_attention(early_features)
         
-        # 3. Reshape and pass through intermediate decoder
         spatial_early = self._reshape_to_spatial(fused_early)
         decoded_early = self.intermediate_decoder(spatial_early)
         
-        # 4. Standard prediction head mapping
         feat_o = self.org_neck(decoded_early)
         out_o = self.pixel_shuffle(self.org_out(feat_o))
         style_o = torch.mean(feat_o, dim=(2, 3))
@@ -450,8 +482,12 @@ class CellposeModel():
             models_logger.info("\n>>> [MODELS] UNFREEZING BACKBONE: The entire network will be trained (End-to-End).")
             
         for name, param in self.net.named_parameters():
-            if any(key in name for key in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention', 'intermediate_decoder']):
-                param.requires_grad = True  # Deep Upsampling Paths ALWAYS train
+            # HEAD 2: cell_predict is STRICTLY evaluation-only. Remains frozen.
+            if any(key in name for key in ['cell_predict_neck', 'cell_predict_out']):
+                param.requires_grad = False 
+            # HEAD 1 & 3: Deep Upsampling Paths ALWAYS train
+            elif any(key in name for key in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention', 'intermediate_decoder']):
+                param.requires_grad = True  
             elif name in ['alpha', 'beta']:
                 param.requires_grad = getattr(self.net, 'learn_volcano', False) # Check learnable toggle
             else:
@@ -562,6 +598,10 @@ class CellposeModel():
                 normalize_params["norm3D"] = False
         if do_normalization:
             x = transforms.normalize_img(x, **normalize_params)
+
+        # Force evaluation mode context
+        if hasattr(self.net, 'eval'):
+            self.net.eval()
 
         network_outputs = self._run_net(
             x,
@@ -725,8 +765,8 @@ class CellposeModel():
                     else:
                         x_in = x
                     x_in = transforms.resize_image(x_in.transpose(1,0,2,3),
-                                            Ly=int(Lz*anisotropy*rescale), 
-                                            Lx=int(Lx*rescale)).transpose(1,0,2,3)
+                                                    Ly=int(Lz*anisotropy*rescale), 
+                                                    Lx=int(Lx*rescale)).transpose(1,0,2,3)
                 else:
                     x_in = x
                 yf, styles = run_3D(self.net, x_in,
