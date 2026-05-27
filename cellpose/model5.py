@@ -69,45 +69,54 @@ def get_user_models():
 
 
 # =================================================================
-# EARLY FEATURE DECODING MODULES
+# HYBRID ORGANELLE MODULES (Cross-Layer Attn + ASPP + Transformer)
 # =================================================================
 
-class LayerWiseAttention(nn.Module):
-    def __init__(self, embed_dim=1024, num_layers=5):
+class CrossLayerAttentionConcat(nn.Module):
+    """
+    Treats the L different layers as a sequence of L tokens for each spatial pixel.
+    Applies Self-Attention across the layers to let them communicate,
+    then concatenates the attended features and fuses them.
+    """
+    def __init__(self, embed_dim=1024, num_layers=5, num_heads=8):
         super().__init__()
-        self.attn_net = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 4),
-            nn.ReLU(),
-            nn.Linear(embed_dim // 4, 1)
+        self.num_layers = num_layers
+        # Self-Attention across the layers
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # Attention-based concat reduction
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(embed_dim * num_layers, embed_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.ReLU(inplace=True)
         )
 
     def forward(self, features):
-        # Stack intermediate features from all layers
-        stacked = torch.stack(features, dim=1) 
+        # features: list of L tensors of shape (B, C, H, W)
+        B, C, H, W = features[0].shape
         
-        # Dynamically pool spatial/sequence dimensions based on ViT output format
-        pooled = stacked
-        while pooled.ndim > 3:
-            if pooled.shape[-1] == 1024:
-                pooled = pooled.mean(dim=(2, 3)) # (B, L, H, W, C) -> (B, L, C)
-                break
-            elif pooled.shape[2] == 1024:
-                pooled = pooled.mean(dim=(3, 4)) # (B, L, C, H, W) -> (B, L, C)
-                break
-            else:
-                pooled = pooled.mean(dim=-2) # Fallback
+        # Stack to (B, L, C, H, W)
+        stacked = torch.stack(features, dim=1)
+        
+        # Rearrange to treat each pixel as a batch element with sequence length L
+        # (B, L, C, H, W) -> (B, H, W, L, C) -> (B*H*W, L, C)
+        x = stacked.permute(0, 3, 4, 1, 2).reshape(B * H * W, self.num_layers, C)
+        
+        # Cross-Layer Self-Attention!
+        x_norm = self.norm(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + attn_out # Residual connection
+        
+        # Reshape back to spatial multi-layer: (B*H*W, L, C) -> (B, H, W, L, C) -> (B, L, C, H, W)
+        x = x.view(B, H, W, self.num_layers, C).permute(0, 3, 4, 1, 2)
+        
+        # Attention-based CONCAT! (B, L*C, H, W)
+        x_concat = x.reshape(B, self.num_layers * C, H, W)
+        
+        # Fuse back down to (B, C, H, W)
+        return self.fusion_conv(x_concat)
 
-        # Calculate attention weights across layers
-        attn_scores = self.attn_net(pooled)           # (B, L, 1)
-        attn_weights = F.softmax(attn_scores, dim=1)  # (B, L, 1)
-        
-        # Broadcast weights across spatial dimensions
-        for _ in range(stacked.ndim - attn_weights.ndim):
-            attn_weights = attn_weights.unsqueeze(-1)
-        
-        # Apply weights and sum
-        weighted_features = stacked * attn_weights 
-        return weighted_features.sum(dim=1)
 
 class TransformerBlock(nn.Module):
     """ Standard Multi-Head Self Attention + MLP Block """
@@ -130,39 +139,94 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-class OrganelleTransformer(nn.Module):
-    """ 3-Block Transformer module to process fused features """
-    def __init__(self, embed_dim=1024, depth=3, num_heads=16, mlp_ratio=4.0):
+
+class DilatedLocalExtractor(nn.Module):
+    """ 
+    ASPP Block using Dilated Convolutions to process local high-frequency details.
+    """
+    def __init__(self, embed_dim=1024):
         super().__init__()
-        self.blocks = nn.ModuleList([
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, padding=1, dilation=1, bias=False),
+            nn.BatchNorm2d(embed_dim // 4),
+            nn.ReLU(inplace=True)
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, padding=3, dilation=3, bias=False),
+            nn.BatchNorm2d(embed_dim // 4),
+            nn.ReLU(inplace=True)
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, padding=5, dilation=5, bias=False),
+            nn.BatchNorm2d(embed_dim // 4),
+            nn.ReLU(inplace=True)
+        )
+        self.branch4 = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embed_dim // 4),
+            nn.ReLU(inplace=True)
+        )
+        self.mixer = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.ReLU(inplace=True)
+        )
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        # x is spatial: (B, C, H, W)
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        b4 = self.branch4(x)
+        merged = torch.cat([b1, b2, b3, b4], dim=1)
+        mixed = self.mixer(merged)
+        return x + self.gamma * mixed
+
+
+class HybridOrganelleTransformer(nn.Module):
+    """ Alternates between Transformer Blocks and ASPP blocks if ASPP=True """
+    def __init__(self, embed_dim=1024, depth=3, num_heads=16, mlp_ratio=4.0, use_aspp=False):
+        super().__init__()
+        self.depth = depth
+        self.use_aspp = use_aspp
+        
+        self.transformer_blocks = nn.ModuleList([
             TransformerBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
             for _ in range(depth)
         ])
+        
+        if self.use_aspp:
+            # We insert ASPP between the transformers (so depth-1 ASPP blocks)
+            self.aspp_blocks = nn.ModuleList([
+                DilatedLocalExtractor(embed_dim=embed_dim)
+                for _ in range(depth - 1)
+            ])
+            
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        # Safely standardize input to (B, L, C) regardless of incoming ViT spatial format
-        is_spatial = False
-        B = x.shape[0]
-        if x.ndim == 4:
-            is_spatial = True
-            if x.shape[1] == 1024:  # Format (B, C, H, W)
-                C, H, W = x.shape[1:]
-                x = x.view(B, C, -1).transpose(1, 2)
-            elif x.shape[-1] == 1024: # Format (B, H, W, C)
-                H, W, C = x.shape[1:]
-                x = x.view(B, -1, C)
-                
-        # Run through Transformer Blocks
-        for block in self.blocks:
-            x = block(x)
-        x = self.norm(x)
+        B, C, H, W = x.shape
         
-        # Reconstruct spatial grid if the original input was spatial
-        if is_spatial and 'H' in locals() and 'W' in locals():
-            x = x.transpose(1, 2).view(B, -1, H, W).contiguous()
+        for i in range(self.depth):
+            # 1. To Sequence Format for Transformer
+            x_seq = x.view(B, C, -1).transpose(1, 2)
+            x_seq = self.transformer_blocks[i](x_seq)
             
+            # 2. Back to Spatial Format
+            x = x_seq.transpose(1, 2).view(B, C, H, W).contiguous()
+            
+            # 3. Apply ASPP if enabled AND we are between transformers
+            if self.use_aspp and i < (self.depth - 1):
+                x = self.aspp_blocks[i](x)
+                
+        # Final Norm
+        x_seq = x.view(B, C, -1).transpose(1, 2)
+        x_seq = self.norm(x_seq)
+        x = x_seq.transpose(1, 2).view(B, C, H, W).contiguous()
+        
         return x
+
 
 class IntermediateDecoder(nn.Module):
     def __init__(self, embed_dim=1024):
@@ -189,9 +253,9 @@ class DualPathTransformer(nn.Module):
     Wraps the ViT backbone to securely branch outputs into three heads:
     1. cell_head (trainable)
     2. cell_predict (frozen eval anchor)
-    3. organelle (trainable early-hook fusion via LayerWiseAttention -> 3x Transformer)
+    3. organelle (trainable early-hook fusion via CrossLayerAttentionConcat -> HybridTransformer)
     """
-    def __init__(self, base_net, randomize_org=False, learn_volcano=True, alpha=1.0, beta=0.1):
+    def __init__(self, base_net, randomize_org=False, learn_volcano=True, alpha=1.0, beta=0.1, use_aspp=False):
         super().__init__()
         self.base_net = base_net
         self._true_dtype = next(base_net.parameters()).dtype
@@ -213,23 +277,20 @@ class DualPathTransformer(nn.Module):
         # ===================================================
         # HEAD 1: CELL HEAD (TRAINING)
         # ===================================================
-        # Initialized with original CPSAM weights
         self.cell_neck = copy.deepcopy(base_net.encoder.neck)
         self.cell_out = copy.deepcopy(base_net.out)
         
         # ===================================================
         # HEAD 2: CELL PREDICT HEAD (EVALUATION / FROZEN)
         # ===================================================
-        # Initialized with exact same CPSAM weights
         self.cell_predict_neck = copy.deepcopy(base_net.encoder.neck)
         self.cell_predict_out = copy.deepcopy(base_net.out)
         
         # ===================================================
         # HEAD 3: ORGANELLE HEAD
         # ===================================================
-        # Initialized Layer-wise Attention + 3-Block Transformer + Conv Decoder + Prediction Heads
-        self.layer_attention = LayerWiseAttention(embed_dim=1024, num_layers=len(self.target_layers)).to(self._true_dtype)
-        self.organelle_transformer = OrganelleTransformer(embed_dim=1024, depth=3).to(self._true_dtype)
+        self.layer_attention_concat = CrossLayerAttentionConcat(embed_dim=1024, num_layers=len(self.target_layers)).to(self._true_dtype)
+        self.organelle_transformer = HybridOrganelleTransformer(embed_dim=1024, depth=3, use_aspp=use_aspp).to(self._true_dtype)
         self.intermediate_decoder = IntermediateDecoder(embed_dim=1024).to(self._true_dtype)
         
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
@@ -375,20 +436,19 @@ class DualPathTransformer(nn.Module):
         style_c = torch.mean(feat_c, dim=(2, 3))
         
         # ========================================
-        # ORGANELLE PATHWAY (LAYERS 4, 6, 8, 10, 12 -> TRANSFORMER)
+        # ORGANELLE PATHWAY 
         # ========================================
-        # Gather early features from hooks
-        early_features = [self.intermediate_features[i] for i in self.target_layers]
+        # 1. Gather early features from hooks and ensure they are spatial (B, C, H, W)
+        spatial_features = [self._reshape_to_spatial(self.intermediate_features[i]) for i in self.target_layers]
         
-        # Fuse via LayerWiseAttention
-        fused_early = self.layer_attention(early_features)
+        # 2. Fuse via Cross-Layer Attention Concat
+        fused_early = self.layer_attention_concat(spatial_features)
         
-        # Pass the fused features through the 3-block transformer module
+        # 3. Pass through the Hybrid Transformer (alternates Transformer / ASPP)
         transformed_early = self.organelle_transformer(fused_early)
         
-        # Spatially format and pass through the intermediate convolutional decoder
-        spatial_early = self._reshape_to_spatial(transformed_early)
-        decoded_early = self.intermediate_decoder(spatial_early)
+        # 4. Final convolutional decoding
+        decoded_early = self.intermediate_decoder(transformed_early)
         
         feat_o = self.org_neck(decoded_early)
         out_o = self.pixel_shuffle(self.org_out(feat_o))
@@ -422,7 +482,7 @@ class CellposeModel():
 
     def __init__(self, gpu=False, pretrained_model="cpsam", custom_weights=None, model_type=None,
                  diam_mean=None, device=None, nchan=None, use_bfloat16=True, manual=True, 
-                 freeze_backbone=False, random=False, learn_volcano=True, alpha=1.0, beta=0.1):
+                 freeze_backbone=False, random=False, learn_volcano=True, alpha=1.0, beta=0.1, ASPP=False):
 
         if diam_mean is not None:
             models_logger.warning("diam_mean argument are not used in v4.0.1+. Ignoring this argument...")
@@ -516,7 +576,8 @@ class CellposeModel():
                 randomize_org=random,
                 learn_volcano=learn_volcano,
                 alpha=alpha,
-                beta=beta
+                beta=beta,
+                use_aspp=ASPP
             ).to(self.device)
         else:
             self.net = base_net
@@ -548,7 +609,7 @@ class CellposeModel():
             if any(key in name for key in ['cell_predict_neck', 'cell_predict_out']):
                 param.requires_grad = False 
             # HEAD 1 & 3: Deep Upsampling Paths, Layer Attention & Organelle Transformer ALWAYS train
-            elif any(key in name for key in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention', 'organelle_transformer', 'intermediate_decoder']):
+            elif any(key in name for key in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention_concat', 'organelle_transformer', 'intermediate_decoder']):
                 param.requires_grad = True  
             elif name in ['alpha', 'beta']:
                 param.requires_grad = getattr(self.net, 'learn_volcano', False) # Check learnable toggle
