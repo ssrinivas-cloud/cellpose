@@ -69,45 +69,63 @@ def get_user_models():
 
 
 # =================================================================
-# EARLY FEATURE DECODING MODULES
+# ORGANELLE TRANSFORMER & DECODING MODULES
 # =================================================================
 
-class LayerWiseAttention(nn.Module):
-    def __init__(self, embed_dim=1024, num_layers=6):
+class TransformerBlock(nn.Module):
+    """ Standard Multi-Head Self Attention + MLP Block """
+    def __init__(self, dim=1024, num_heads=16, mlp_ratio=4.0):
         super().__init__()
-        self.attn_net = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 4),
-            nn.ReLU(),
-            nn.Linear(embed_dim // 4, 1)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        hidden_features = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_features),
+            nn.GELU(),
+            nn.Linear(hidden_features, dim)
         )
 
-    def forward(self, features):
-        # Stack intermediate features from all layers
-        stacked = torch.stack(features, dim=1) 
-        
-        # Dynamically pool spatial/sequence dimensions based on ViT output format
-        pooled = stacked
-        while pooled.ndim > 3:
-            if pooled.shape[-1] == 1024:
-                pooled = pooled.mean(dim=(2, 3)) # (B, L, H, W, C) -> (B, L, C)
-                break
-            elif pooled.shape[2] == 1024:
-                pooled = pooled.mean(dim=(3, 4)) # (B, L, C, H, W) -> (B, L, C)
-                break
-            else:
-                pooled = pooled.mean(dim=-2) # Fallback
+    def forward(self, x):
+        # x expected shape: (B, L, C)
+        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
 
-        # Calculate attention weights across layers
-        attn_scores = self.attn_net(pooled)           # (B, L, 1)
-        attn_weights = F.softmax(attn_scores, dim=1)  # (B, L, 1)
+class OrganelleTransformer(nn.Module):
+    """ 3-Block Transformer module to process the 8th layer ViT features """
+    def __init__(self, embed_dim=1024, depth=3, num_heads=16, mlp_ratio=4.0):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            TransformerBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        # Safely standardize input to (B, L, C) regardless of incoming ViT spatial format
+        is_spatial = False
+        B = x.shape[0]
+        if x.ndim == 4:
+            is_spatial = True
+            if x.shape[1] == 1024:  # Format (B, C, H, W)
+                C, H, W = x.shape[1:]
+                x = x.view(B, C, -1).transpose(1, 2)
+            elif x.shape[-1] == 1024: # Format (B, H, W, C)
+                H, W, C = x.shape[1:]
+                x = x.view(B, -1, C)
+                
+        # Run through Transformer Blocks
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
         
-        # Broadcast weights across spatial dimensions
-        for _ in range(stacked.ndim - attn_weights.ndim):
-            attn_weights = attn_weights.unsqueeze(-1)
-        
-        # Apply weights and sum
-        weighted_features = stacked * attn_weights 
-        return weighted_features.sum(dim=1)
+        # Reconstruct spatial grid if the original input was spatial
+        if is_spatial and 'H' in locals() and 'W' in locals():
+            x = x.transpose(1, 2).view(B, -1, H, W).contiguous()
+            
+        return x
 
 class IntermediateDecoder(nn.Module):
     def __init__(self, embed_dim=1024):
@@ -134,7 +152,7 @@ class DualPathTransformer(nn.Module):
     Wraps the ViT backbone to securely branch outputs into three heads:
     1. cell_head (trainable)
     2. cell_predict (frozen eval anchor)
-    3. organelle (trainable early-hook fusion)
+    3. organelle (trainable early-hook fusion via a 3-block transformer)
     """
     def __init__(self, base_net, randomize_org=False, learn_volcano=True, alpha=1.0, beta=0.1):
         super().__init__()
@@ -145,9 +163,9 @@ class DualPathTransformer(nn.Module):
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         
         # ---------------------------------------------------
-        # 0. SETUP HOOKS FOR EARLY LAYERS (ORGANELLE PATH)
+        # 0. SETUP HOOK FOR 8TH LAYER (ORGANELLE PATH)
         # ---------------------------------------------------
-        self.target_layers = [4, 6, 8, 10, 12, 14]
+        self.target_layers = [8]
         self.intermediate_features = {}
         
         for layer_idx in self.target_layers:
@@ -172,8 +190,8 @@ class DualPathTransformer(nn.Module):
         # ===================================================
         # HEAD 3: ORGANELLE HEAD
         # ===================================================
-        # Initialized with exact same CPSAM weights
-        self.layer_attention = LayerWiseAttention(embed_dim=1024, num_layers=len(self.target_layers)).to(self._true_dtype)
+        # Initialized 3-Block Transformer + Conv Decoder + Prediction Heads
+        self.organelle_transformer = OrganelleTransformer(embed_dim=1024, depth=3).to(self._true_dtype)
         self.intermediate_decoder = IntermediateDecoder(embed_dim=1024).to(self._true_dtype)
         
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
@@ -319,13 +337,16 @@ class DualPathTransformer(nn.Module):
         style_c = torch.mean(feat_c, dim=(2, 3))
         
         # ========================================
-        # ORGANELLE PATHWAY
+        # ORGANELLE PATHWAY (LAYER 8)
         # ========================================
-        # Gather early features from hooks
-        early_features = [self.intermediate_features[i] for i in self.target_layers]
-        fused_early = self.layer_attention(early_features)
+        # Extract features exclusively from the 8th layer
+        early_feature = self.intermediate_features[8]
         
-        spatial_early = self._reshape_to_spatial(fused_early)
+        # Process through the 3-block transformer module
+        transformed_early = self.organelle_transformer(early_feature)
+        
+        # Spatially format and pass through the intermediate convolutional decoder
+        spatial_early = self._reshape_to_spatial(transformed_early)
         decoded_early = self.intermediate_decoder(spatial_early)
         
         feat_o = self.org_neck(decoded_early)
@@ -485,8 +506,8 @@ class CellposeModel():
             # HEAD 2: cell_predict is STRICTLY evaluation-only. Remains frozen.
             if any(key in name for key in ['cell_predict_neck', 'cell_predict_out']):
                 param.requires_grad = False 
-            # HEAD 1 & 3: Deep Upsampling Paths ALWAYS train
-            elif any(key in name for key in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention', 'intermediate_decoder']):
+            # HEAD 1 & 3: Deep Upsampling Paths & Organelle Transformer ALWAYS train
+            elif any(key in name for key in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'organelle_transformer', 'intermediate_decoder']):
                 param.requires_grad = True  
             elif name in ['alpha', 'beta']:
                 param.requires_grad = getattr(self.net, 'learn_volcano', False) # Check learnable toggle
