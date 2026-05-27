@@ -155,7 +155,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, 
-              unfreeze_backbone=50, turnoff_cell_loss=False, only_cell_loss=False, 
+              unfreeze_backbone=50, test_result=10, turnoff_cell_loss=False, only_cell_loss=False, 
               two_tail=False, cell_loss_coeff=1, org_loss_coeff=1, **kwargs):
     
     device = net.device
@@ -402,7 +402,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 
             is_frozen = False
 
-        if iepoch == 5 or iepoch % 10 == 0:
+        # ONLY RUN EVALUATION ON test_result INTERVALS, OR ON THE FINAL EPOCH
+        if iepoch % test_result == 0 or iepoch == n_epochs - 1:
             lavgt = 0.
             if test_data:
                 rperm_test = np.random.permutation(nimg_test)
@@ -450,85 +451,85 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     net.save_model(best_model_path)
                     train_logger.info(f"*** New Best Model Saved! Test Loss: {best_test_loss:.4f} ***")
 
+            # =====================================================================
+            # FULL IMAGE POST-PROCESSING EVALUATION & VISUALIZATION (Runs at same interval)
+            # =====================================================================
+            if debug and test_data:
+                temp_model_path = str(filename) + f"_eval_temp"
+                net.save_model(temp_model_path)
+                eval_model = model5.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
+                
+                masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
+                pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
+                gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
+                
+                n_cells_pred = pred_cells[0].max() if np.any(pred_cells[0]) else 0
+                n_orgs_pred = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
+                n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
+                n_orgs_gt = gt_orgs[0].max() if np.any(gt_orgs[0]) else 0
+                
+                train_logger.info(f"--- [DEBUG] Full Image Counts -> CELLS: Pred {n_cells_pred} (GT {n_cells_gt}) | ORGS: Pred {n_orgs_pred} (GT {n_orgs_gt}) ---")
+                
+                def calc_metrics(gt_masks, pred_masks):
+                    tp = fp = fn = 0
+                    for gt, pred in zip(gt_masks, pred_masks):
+                        gt_bin, pred_bin = gt > 0, pred > 0
+                        tp += np.logical_and(gt_bin, pred_bin).sum()
+                        fp += np.logical_and(~gt_bin, pred_bin).sum()
+                        fn += np.logical_and(gt_bin, ~pred_bin).sum()  
+                    return tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
+                
+                train_logger.info(f"--- [DEBUG] Test IOU -> CELLS: {calc_metrics(gt_cells, pred_cells):.4f} | ORGANELLES: {calc_metrics(gt_orgs, pred_orgs):.4f} ---")
+
+                if visualize:
+                    try:
+                        fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+                        fig.suptitle(f"Epoch {iepoch} - Post-Processed Mask Reconstructions", fontsize=18, y=0.98)
+                        
+                        img_disp = test_data[0].copy()
+                        if img_disp.ndim == 3 and img_disp.shape[0] in [2, 3, 6]:
+                            img_disp = img_disp.transpose(1, 2, 0)
+                        
+                        if img_disp.max() > img_disp.min(): 
+                            img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
+                        
+                        img_cell = img_disp[..., 0] 
+                        img_org = img_disp[..., 3] if two_tail else (img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0])
+                        
+                        axes[0, 0].imshow(img_cell, cmap='gray')
+                        if np.any(gt_cells[0]): axes[0, 0].contour(gt_cells[0] > 0, colors='lime', linewidths=1.2)
+                        axes[0, 0].set_title(f"Cells - Actual GT ({n_cells_gt} masks)", fontsize=12)
+                        axes[0, 0].axis('off')
+                        
+                        axes[0, 1].imshow(img_cell, cmap='gray')
+                        if np.any(pred_cells[0]): axes[0, 1].contour(pred_cells[0] > 0, colors='red', linewidths=1.2)
+                        axes[0, 1].set_title(f"Cells - Predicted Reconstructed ({n_cells_pred} masks)", fontsize=12)
+                        axes[0, 1].axis('off')
+                        
+                        axes[1, 0].imshow(img_org, cmap='gray')
+                        if np.any(gt_orgs[0]): axes[1, 0].contour(gt_orgs[0] > 0, colors='lime', linewidths=1.2)
+                        axes[1, 0].set_title(f"Organelles - Actual GT ({n_orgs_gt} masks)", fontsize=12)
+                        axes[1, 0].axis('off')
+                        
+                        axes[1, 1].imshow(img_org, cmap='gray')
+                        if np.any(pred_orgs[0]): axes[1, 1].contour(pred_orgs[0] > 0, colors='red', linewidths=1.2)
+                        axes[1, 1].set_title(f"Organelles - Predicted Reconstructed ({n_orgs_pred} masks)", fontsize=12)
+                        axes[1, 1].axis('off')
+                        
+                        plt.tight_layout()
+                        vis_save_path = save_path / f"epoch_{iepoch:04d}_post_processed_overlay.png"
+                        plt.savefig(vis_save_path, bbox_inches='tight', dpi=150)
+                        plt.close(fig)
+                        train_logger.info(f"[DEBUG] Post-processing visualization overlay written to: {vis_save_path}")
+                    except Exception as e:
+                        train_logger.warning(f"Post-processed overlay execution block errored: {e}")
+                
+                del eval_model
+                torch.cuda.empty_cache()
+
         lavg /= nsum
         train_logger.info(f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s")
         lavg, nsum = 0, 0
-
-        # =====================================================================
-        # FULL IMAGE POST-PROCESSING EVALUATION & VISUALIZATION
-        # =====================================================================
-        if debug and test_data:
-            temp_model_path = str(filename) + f"_eval_temp"
-            net.save_model(temp_model_path)
-            eval_model = model5.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
-            
-            masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
-            pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
-            gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
-            
-            n_cells_pred = pred_cells[0].max() if np.any(pred_cells[0]) else 0
-            n_orgs_pred = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
-            n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
-            n_orgs_gt = gt_orgs[0].max() if np.any(gt_orgs[0]) else 0
-            
-            train_logger.info(f"--- [DEBUG] Full Image Counts -> CELLS: Pred {n_cells_pred} (GT {n_cells_gt}) | ORGS: Pred {n_orgs_pred} (GT {n_orgs_gt}) ---")
-            
-            def calc_metrics(gt_masks, pred_masks):
-                tp = fp = fn = 0
-                for gt, pred in zip(gt_masks, pred_masks):
-                    gt_bin, pred_bin = gt > 0, pred > 0
-                    tp += np.logical_and(gt_bin, pred_bin).sum()
-                    fp += np.logical_and(~gt_bin, pred_bin).sum()
-                    fn += np.logical_and(gt_bin, ~pred_bin).sum()  
-                return tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
-            
-            train_logger.info(f"--- [DEBUG] Test IOU -> CELLS: {calc_metrics(gt_cells, pred_cells):.4f} | ORGANELLES: {calc_metrics(gt_orgs, pred_orgs):.4f} ---")
-
-            if visualize:
-                try:
-                    fig, axes = plt.subplots(2, 2, figsize=(16, 16))
-                    fig.suptitle(f"Epoch {iepoch} - Post-Processed Mask Reconstructions", fontsize=18, y=0.98)
-                    
-                    img_disp = test_data[0].copy()
-                    if img_disp.ndim == 3 and img_disp.shape[0] in [2, 3, 6]:
-                        img_disp = img_disp.transpose(1, 2, 0)
-                    
-                    if img_disp.max() > img_disp.min(): 
-                        img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
-                    
-                    img_cell = img_disp[..., 0] 
-                    img_org = img_disp[..., 3] if two_tail else (img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0])
-                    
-                    axes[0, 0].imshow(img_cell, cmap='gray')
-                    if np.any(gt_cells[0]): axes[0, 0].contour(gt_cells[0] > 0, colors='lime', linewidths=1.2)
-                    axes[0, 0].set_title(f"Cells - Actual GT ({n_cells_gt} masks)", fontsize=12)
-                    axes[0, 0].axis('off')
-                    
-                    axes[0, 1].imshow(img_cell, cmap='gray')
-                    if np.any(pred_cells[0]): axes[0, 1].contour(pred_cells[0] > 0, colors='red', linewidths=1.2)
-                    axes[0, 1].set_title(f"Cells - Predicted Reconstructed ({n_cells_pred} masks)", fontsize=12)
-                    axes[0, 1].axis('off')
-                    
-                    axes[1, 0].imshow(img_org, cmap='gray')
-                    if np.any(gt_orgs[0]): axes[1, 0].contour(gt_orgs[0] > 0, colors='lime', linewidths=1.2)
-                    axes[1, 0].set_title(f"Organelles - Actual GT ({n_orgs_gt} masks)", fontsize=12)
-                    axes[1, 0].axis('off')
-                    
-                    axes[1, 1].imshow(img_org, cmap='gray')
-                    if np.any(pred_orgs[0]): axes[1, 1].contour(pred_orgs[0] > 0, colors='red', linewidths=1.2)
-                    axes[1, 1].set_title(f"Organelles - Predicted Reconstructed ({n_orgs_pred} masks)", fontsize=12)
-                    axes[1, 1].axis('off')
-                    
-                    plt.tight_layout()
-                    vis_save_path = save_path / f"epoch_{iepoch:04d}_post_processed_overlay.png"
-                    plt.savefig(vis_save_path, bbox_inches='tight', dpi=150)
-                    plt.close(fig)
-                    train_logger.info(f"[DEBUG] Post-processing visualization overlay written to: {vis_save_path}")
-                except Exception as e:
-                    train_logger.warning(f"Post-processed overlay execution block errored: {e}")
-            
-            del eval_model
-            torch.cuda.empty_cache()
 
     # Final safeguard save
     net.save_model(str(filename))
