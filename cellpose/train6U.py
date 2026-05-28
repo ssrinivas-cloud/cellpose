@@ -184,12 +184,21 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     nimg = len(train_data)
     nimg_test = len(test_data) if test_data else 0
 
-    warmup_epochs = min(10, n_epochs // 10) 
-    cosine_epochs = max(0, n_epochs - warmup_epochs)
-    LR_warmup = np.linspace(0, learning_rate, warmup_epochs)
-    min_lr = learning_rate * 0.01 
-    LR_cosine = min_lr + 0.5 * (learning_rate - min_lr) * (1 + np.cos(np.pi * np.arange(cosine_epochs) / cosine_epochs)) if cosine_epochs > 0 else np.array([])
-    LR = np.concatenate([LR_warmup, LR_cosine])
+    # =================================================================
+    # CUSTOM STEP-DOWN LEARNING RATE SCHEDULE
+    # =================================================================
+    LR = np.linspace(0, learning_rate, 10)
+    LR = np.append(LR, learning_rate * np.ones(max(0, n_epochs - 10)))
+    if n_epochs > 300:
+        LR = LR[:-100]
+        for i in range(10):
+            LR = np.append(LR, LR[-1] / 2 * np.ones(10))
+    elif n_epochs > 99:
+        LR = LR[:-50]
+        for i in range(10):
+            LR = np.append(LR, LR[-1] / 2 * np.ones(5))
+    # Safety truncation in case array is slightly larger than n_epochs
+    LR = LR[:n_epochs]
     
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}, two_tail={two_tail}, test_interval={test_interval}")
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
@@ -362,6 +371,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         axes[1, 2].axis('off')
                         
                         plt.tight_layout()
+                        # NOTE: For inline Jupyter Notebook viewing, you could add `plt.show()` here if desired.
+                        # Leaving as save-only for the training loop debug crops to prevent Jupyter from freezing up on huge epochs.
                         plt.savefig(save_path / f"debug_training_crop_epoch_{iepoch:04d}.png")
                         plt.close(fig)
                     except Exception as e:
@@ -586,7 +597,10 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         plt.tight_layout()
                         vis_save_path = save_path / f"epoch_{iepoch:04d}_img_{img_idx}_post_processed_overlay.png"
                         plt.savefig(vis_save_path, bbox_inches='tight', dpi=150)
-                        plt.close(fig)
+                        
+                        # ---> JUPYTER NOTEBOOK INLINE DISPLAY <---
+                        plt.show() 
+                        
                     train_logger.info(f"[DEBUG] Post-processing visualization overlays written to: {save_path}")
                 except Exception as e:
                     train_logger.warning(f"Post-processed overlay execution block errored: {e}")
@@ -599,7 +613,10 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
     if original_net_dtype != torch.float32: net.dtype = original_net_dtype
 
+    # =================================================================
     # --- HUGGING FACE BEST MODEL PUSH ---
+    # Creates repo if it doesn't exist, pushes best weights directly
+    # =================================================================
     if hf_repo_id and hf_token:
         train_logger.info(f">>> Uploading BEST model ({best_model_path}) to Hugging Face Hub: {hf_repo_id}")
         api = HfApi(token=hf_token)
