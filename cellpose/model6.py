@@ -193,8 +193,9 @@ class DualParasiteSwinNetwork(nn.Module):
         out_c, out_o = None, None
         
         # Fake "styles" for Cellpose compatibility by pooling the deepest feature map used
-        style_c = torch.mean(s4, dim=(2, 3))
-        style_o = torch.mean(s3, dim=(2, 3))
+        # Sliced to [:, :256] to satisfy Cellpose's internal run_net style broadcasting
+        style_c = torch.mean(s4, dim=(2, 3))[:, :256]
+        style_o = torch.mean(s3, dim=(2, 3))[:, :256]
 
         # --- PARASITE ROUTING ---
         if self.active_head in ['cells', 'both']:
