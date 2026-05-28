@@ -1,5 +1,6 @@
 """
 Copyright © 2026 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
+Updated for compatibility with model6.py (Dual-Parasite Swin-FPN Architecture).
 """
 
 import time
@@ -7,7 +8,7 @@ import os
 import numpy as np
 import scipy.ndimage
 import matplotlib.pyplot as plt  
-from cellpose import io, utils, dynamics, model5
+from cellpose import io, utils, dynamics, model6  # <--- Updated to model6
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
@@ -15,8 +16,6 @@ from torch import nn
 import torch.nn.functional as F
 import logging
 from huggingface_hub import HfApi
-
-# Ensure we are pulling your exact 3-head architecture
 
 train_logger = logging.getLogger(__name__)
 
@@ -176,7 +175,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               rescale=False, scale_range=0.5, bsize=256,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, 
-              unfreeze_backbone=50, test_result=10, normalize_loss=False, 
+              unfreeze_schedule=[20, 5], test_result=10, normalize_loss=False, 
               turnoff_cell_loss=False, only_cell_loss=False, 
               two_tail=False, cell_loss_coeff=1.0, org_loss_coeff=1.0, **kwargs):
     
@@ -188,7 +187,10 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     out = _process_train_test_paired(train_data, train_labels_c, train_labels_o, test_data, test_labels_c, test_labels_o, device=device)
     train_flows_c, train_flows_o, test_flows_c, test_flows_o, diam_train, diam_test = out
     
-    net.diam_labels.data = torch.Tensor([diam_train.mean()]).to(device)
+    # Safe handling for diam_labels in case architecture dropped it
+    if hasattr(net, 'diam_labels'):
+        net.diam_labels.data = torch.Tensor([diam_train.mean()]).to(device)
+        
     nimg = len(train_data)
     nimg_test = len(test_data) if test_data else 0
 
@@ -227,32 +229,29 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         eff_org_coeff = org_loss_coeff
 
     # =================================================================
-    # PARAMETER FREEZE LOGIC (cell_predict tied to backbone)
+    # PARAMETER FREEZE LOGIC (Cyclic Freeze/Unfreeze)
     # =================================================================
-    unfreeze_backbone = max(0, min(100, unfreeze_backbone))
-    unfreeze_epoch = int((unfreeze_backbone / 100.0) * n_epochs)
-    
-    is_frozen = unfreeze_epoch > 0
-
-    if is_frozen:
-        if unfreeze_epoch >= n_epochs:
-            train_logger.info(f"\n>>> [MODELS] Backbone & cell_predict will remain PERMANENTLY frozen (unfreeze_backbone={unfreeze_backbone}%).")
-        else:
-            train_logger.info(f"\n>>> [MODELS] Phase 1: Freezing ViT Backbone & cell_predict. Will unfreeze at Epoch {unfreeze_epoch} ({unfreeze_backbone}%).")
+    if unfreeze_schedule is not None and len(unfreeze_schedule) == 2:
+        cycle_interval, unfreeze_duration = unfreeze_schedule
+        train_logger.info(f"\n>>> [MODELS] CYCLIC FREEZE SCHEDULE ACTIVE: Backbone will freeze for {cycle_interval - unfreeze_duration} epochs, then unfreeze for {unfreeze_duration} epochs.")
+        start_frozen = True
     else:
-        train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End from start (unfreeze_backbone=0%).")
+        train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End from start.")
+        start_frozen = False
 
     for name, param in net.named_parameters():
-        if any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'organelle_transformer', 'intermediate_decoder', 'layer_attention']):
-            param.requires_grad = True
+        if any(x in name for x in ['cell_decoder', 'org_decoder']):
+            param.requires_grad = True # Decoders ALWAYS train
         elif name in ['alpha', 'beta']:
             param.requires_grad = getattr(net, 'learn_volcano', False)
+        elif 'backbone' in name:
+            param.requires_grad = not start_frozen # Start in the correct state
         else:
-            # This implicitly ties cell_predict_neck and cell_predict_out to the encoder's is_frozen state
-            param.requires_grad = not is_frozen
+            param.requires_grad = True
 
-    trainable_params = filter(lambda p: p.requires_grad, net.parameters())
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+    # Pass ALL parameters to the optimizer. We will simply toggle requires_grad on/off. 
+    # AdamW will safely ignore parameters when their requires_grad is False.
+    optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
         
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda' and net.dtype in [torch.float16, torch.bfloat16]))
     accumulation_steps = max(1, 8 // batch_size)
@@ -261,7 +260,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         net.active_head = 'both'
 
     t0 = time.time()
-    model_name = f"cellpose_{t0}" if model_name is None else model_name
+    model_name = f"swincell_{t0}" if model_name is None else model_name
     save_path = Path.cwd() / "models"
     save_path.mkdir(exist_ok=True)
     filename = save_path / model_name
@@ -273,6 +272,30 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
     
     for iepoch in range(n_epochs):
+        
+        # =================================================================
+        # CYCLIC AUTO-UNFREEZE / FREEZE TRIGGER 
+        # =================================================================
+        if unfreeze_schedule is not None and len(unfreeze_schedule) == 2:
+            cycle_interval, unfreeze_duration = unfreeze_schedule
+            if iepoch > 0:
+                mod_epoch = iepoch % cycle_interval
+                
+                # Trigger Unfreeze (e.g. at epoch 20, 40, 60...)
+                if mod_epoch == 0:
+                    train_logger.info(f"\n>>> [AUTO-UNFREEZE] Epoch {iepoch}: UNFREEZING backbone for the next {unfreeze_duration} epochs.")
+                    for name, param in net.named_parameters():
+                        if 'backbone' in name:
+                            param.requires_grad = True
+                            
+                # Trigger Freeze (e.g. at epoch 25, 45, 65...)
+                elif mod_epoch == unfreeze_duration:
+                    train_logger.info(f"\n>>> [AUTO-FREEZE] Epoch {iepoch}: FREEZING backbone.")
+                    for name, param in net.named_parameters():
+                        if 'backbone' in name:
+                            param.requires_grad = False
+                            param.grad = None # Safely clear lingering gradients
+        
         rperm = np.random.permutation(nimg)
         for param_group in optimizer.param_groups: param_group["lr"] = LR[iepoch]
         
@@ -285,7 +308,11 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
             imgs, lbls_c, lbls_o = _get_batch(inds, data=train_data, labels_c=train_flows_c, labels_o=train_flows_o, two_tail=two_tail)
             diams = np.array([diam_train[i] for i in inds])
-            rsc = diams / net.diam_mean.item() if rescale else np.ones(len(diams), "float32")
+            
+            # Safe handling if diam_mean is deprecated in new model structure
+            net_diam = getattr(net, 'diam_mean', None)
+            net_diam_val = net_diam.item() if net_diam is not None else 30.0
+            rsc = diams / net_diam_val if rescale else np.ones(len(diams), "float32")
             
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
             imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
@@ -429,22 +456,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
         train_losses[iepoch] /= nimg
 
-        # =================================================================
-        # AUTO-UNFREEZE TRIGGER
-        # =================================================================
-        if is_frozen and iepoch >= unfreeze_epoch and unfreeze_epoch < n_epochs:
-            train_logger.info(f"\n>>> [AUTO-UNFREEZE] Milestone Reached (Epoch {iepoch}/{n_epochs} - {unfreeze_backbone}%). UNFREEZING WHOLE BACKBONE & CELL_PREDICT FOR FINE-TUNING!")
-            
-            newly_unfrozen_params = []
-            for name, param in net.named_parameters(): 
-                if not param.requires_grad:
-                    param.requires_grad = True
-                    newly_unfrozen_params.append(param)
-            
-            if newly_unfrozen_params:
-                optimizer.add_param_group({'params': newly_unfrozen_params, 'lr': LR[iepoch], 'weight_decay': weight_decay})
-                
-            is_frozen = False
 
         if iepoch % test_result == 0 or iepoch == n_epochs - 1:
             lavgt = 0.
@@ -456,7 +467,10 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         inds = rperm_test[ibatch:ibatch + batch_size]
                         imgs, lbls_c, lbls_o = _get_batch(inds, data=test_data, labels_c=test_flows_c, labels_o=test_flows_o, two_tail=two_tail)
                         diams = np.array([diam_test[i] for i in inds])
-                        rsc = diams / net.diam_mean.item() if rescale else np.ones(len(diams), "float32")
+                        
+                        net_diam = getattr(net, 'diam_mean', None)
+                        net_diam_val = net_diam.item() if net_diam is not None else 30.0
+                        rsc = diams / net_diam_val if rescale else np.ones(len(diams), "float32")
                         
                         lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
                         imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
@@ -507,7 +521,9 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             if debug and test_data:
                 temp_model_path = str(filename) + f"_eval_temp"
                 net.save_model(temp_model_path)
-                eval_model = model5.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
+                
+                # Updated to use model6.CellposeModel wrapper
+                eval_model = model6.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
                 
                 masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
                 pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
