@@ -165,6 +165,10 @@ class DualParasiteSwinNetwork(nn.Module):
         if not self.training and self.active_head in ['cells', 'both']:
             with torch.no_grad():
                 feats_pass1 = self.backbone(x)
+                # Ensure correct channel alignment: [B, H, W, C] -> [B, C, H, W]
+                if feats_pass1[3].shape[-1] == 1024:
+                    feats_pass1 = [feat.permute(0, 3, 1, 2).contiguous() for feat in feats_pass1]
+                
                 # Cell hook mapping: High=S4(idx 3), Mid=S3(idx 2), Low=S2(idx 1)
                 out_c_pass1 = self.cell_decoder(feats_pass1[3], feats_pass1[2], feats_pass1[1])
                 prob_map = torch.sigmoid(out_c_pass1[:, 2:3, :, :])
@@ -178,6 +182,13 @@ class DualParasiteSwinNetwork(nn.Module):
             features = self.backbone(x_target)
             
         s1, s2, s3, s4 = features[0], features[1], features[2], features[3]
+
+        # >>> FIX: Permute from [B, H, W, C] to [B, C, H, W] <<<
+        if s4.shape[-1] == 1024:
+            s1 = s1.permute(0, 3, 1, 2).contiguous()
+            s2 = s2.permute(0, 3, 1, 2).contiguous()
+            s3 = s3.permute(0, 3, 1, 2).contiguous()
+            s4 = s4.permute(0, 3, 1, 2).contiguous()
 
         out_c, out_o = None, None
         
