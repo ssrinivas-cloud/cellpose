@@ -55,30 +55,35 @@ def get_user_models():
 
 
 # =================================================================
-# FPN PARASITE DECODERS
+# FPN PARASITE DECODERS (UNIFIED CHANNELS)
 # =================================================================
 
 class ParasiteDecoder(nn.Module):
     """
     Lightweight Feature Pyramid Network (FPN) upsampler.
-    Ingests 3 specific hierarchical stages from the Swin backbone,
-    fuses them top-down, and outputs the final 3-channel flow map.
+    Uses 1x1 lateral convolutions to project all incoming Swin stages 
+    into a unified hidden dimension, eliminating channel mismatch issues.
     """
-    def __init__(self, in_channels_list, final_upsample_factor, out_channels=3):
+    def __init__(self, in_channels_list, hidden_dim=256, final_upsample_factor=8, out_channels=3):
         super().__init__()
-        # in_channels_list expects [C_high, C_mid, C_low] (e.g., [1024, 512, 256])
         
+        # 1x1 Lateral Convolutions to unify the channel dimensions
+        self.lat_high = nn.Conv2d(in_channels_list[0], hidden_dim, kernel_size=1)
+        self.lat_mid  = nn.Conv2d(in_channels_list[1], hidden_dim, kernel_size=1)
+        self.lat_low  = nn.Conv2d(in_channels_list[2], hidden_dim, kernel_size=1)
+
+        # Upsampling and fusion layers
         self.up_high = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.conv_high_mid = nn.Sequential(
-            nn.Conv2d(in_channels_list[0] + in_channels_list[1], in_channels_list[1], 3, padding=1, bias=False),
-            nn.BatchNorm2d(in_channels_list[1]),
+            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True)
         )
 
         self.up_mid = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.conv_mid_low = nn.Sequential(
-            nn.Conv2d(in_channels_list[1] + in_channels_list[2], in_channels_list[2], 3, padding=1, bias=False),
-            nn.BatchNorm2d(in_channels_list[2]),
+            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True)
         )
 
@@ -86,17 +91,22 @@ class ParasiteDecoder(nn.Module):
         self.final_up = nn.Upsample(scale_factor=final_upsample_factor, mode='bilinear', align_corners=False)
         
         # Output: [Flow_Y, Flow_X, Cellprob]
-        self.final_conv = nn.Conv2d(in_channels_list[2], out_channels, kernel_size=1)
+        self.final_conv = nn.Conv2d(hidden_dim, out_channels, kernel_size=1)
 
     def forward(self, x_high, x_mid, x_low):
+        # Unify channels first via 1x1 projections
+        h_high = self.lat_high(x_high)
+        h_mid  = self.lat_mid(x_mid)
+        h_low  = self.lat_low(x_low)
+
         # 1. Top-Down Fusion (High to Mid)
-        x = self.up_high(x_high)
-        x = torch.cat([x, x_mid], dim=1)
+        x = self.up_high(h_high)
+        x = torch.cat([x, h_mid], dim=1)
         x = self.conv_high_mid(x)
 
         # 2. Top-Down Fusion (Mid to Low)
         x = self.up_mid(x)
-        x = torch.cat([x, x_low], dim=1)
+        x = torch.cat([x, h_low], dim=1)
         x = self.conv_mid_low(x)
 
         # 3. Final Native Projection
@@ -109,7 +119,7 @@ class DualParasiteSwinNetwork(nn.Module):
     Houses the frozen Swin feature quarry and routes the stages 
     to the independent Organelle and Cell parasite decoders.
     """
-    def __init__(self, nchan=3, learn_volcano=True, alpha=1.0, beta=0.1):
+    def __init__(self, nchan=3, hidden_dim=256):
         super().__init__()
         self._true_dtype = torch.float32
         self.active_head = 'both'
@@ -121,55 +131,25 @@ class DualParasiteSwinNetwork(nn.Module):
         
         # 2. The Cell Parasite (Hooks into deep semantics: Stages 4, 3, 2)
         # Stage 2 native resolution is 1/8, so final upsample is 8x
-        self.cell_decoder = ParasiteDecoder(in_channels_list=[1024, 512, 256], final_upsample_factor=8)
+        self.cell_decoder = ParasiteDecoder(in_channels_list=[1024, 512, 256], hidden_dim=hidden_dim, final_upsample_factor=8)
         
         # 3. The Organelle Parasite (Hooks into high-res details: Stages 3, 2, 1)
         # Stage 1 native resolution is 1/4, so final upsample is 4x
-        self.org_decoder = ParasiteDecoder(in_channels_list=[512, 256, 128], final_upsample_factor=4)
-
-        # 4. Volcano Merger
-        self.learn_volcano = learn_volcano
-        if self.learn_volcano:
-            self.alpha = nn.Parameter(torch.tensor([float(alpha)], dtype=self._true_dtype))
-            self.beta = nn.Parameter(torch.tensor([float(beta)], dtype=self._true_dtype))
-            models_logger.info(f">>> [VOLCANO MERGER] Learnable Mode Active (alpha={alpha}, beta={beta})")
-        else:
-            self.register_buffer('alpha', torch.tensor([float(alpha)], dtype=self._true_dtype))
-            self.register_buffer('beta', torch.tensor([float(beta)], dtype=self._true_dtype))
+        self.org_decoder = ParasiteDecoder(in_channels_list=[512, 256, 128], hidden_dim=hidden_dim, final_upsample_factor=4)
 
     @property
     def device(self):
         return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return self._true_dtype
 
     def load_model(self, path, device):
         self.load_state_dict(torch.load(path, map_location=device, weights_only=True), strict=False)
 
     def save_model(self, path):
         torch.save(self.state_dict(), path)
-
-    def apply_volcano_merger(self, out_c):
-        import torchvision.transforms.functional as TF
-        
-        cell_flows = out_c[:, :2, :, :]
-        cell_logits = out_c[:, 2:, :, :]
-        
-        prob = torch.sigmoid(cell_logits)
-        prob_dome = TF.gaussian_blur(prob, kernel_size=15, sigma=[3.0, 3.0])
-        
-        grad_y = torch.zeros_like(prob_dome)
-        grad_x = torch.zeros_like(prob_dome)
-        
-        grad_y[:, :, 1:-1, :] = (prob_dome[:, :, 2:, :] - prob_dome[:, :, :-2, :]) / 2.0
-        grad_x[:, :, :, 1:-1] = (prob_dome[:, :, :, 2:] - prob_dome[:, :, :, :-2]) / 2.0
-        
-        dome_flows = torch.cat([grad_y, grad_x], dim=1)
-        merged_flows = (torch.abs(self.alpha) * cell_flows) + (torch.abs(self.beta) * dome_flows)
-        
-        norm = torch.norm(merged_flows, p=2, dim=1, keepdim=True)
-        merged_flows = merged_flows / (norm + 1e-8)
-        merged_flows = merged_flows * 5.0 * prob
-        
-        return torch.cat([merged_flows, cell_logits], dim=1)
 
     def forward(self, x):
         x = x.to(self._true_dtype)
@@ -201,11 +181,9 @@ class DualParasiteSwinNetwork(nn.Module):
         # --- PARASITE ROUTING ---
         if self.active_head in ['cells', 'both']:
             out_c = self.cell_decoder(s4, s3, s2)
-            out_c = self.apply_volcano_merger(out_c)
 
         if self.active_head in ['organelles', 'both']:
             out_o = self.org_decoder(s3, s2, s1)
-            out_o = self.apply_volcano_merger(out_o)
 
         if self.active_head == 'cells':
             return out_c, style_c
@@ -222,7 +200,7 @@ class DualParasiteSwinNetwork(nn.Module):
 class CellposeModel():
     def __init__(self, gpu=False, pretrained_model=None, custom_weights=None, model_type=None,
                  diam_mean=None, device=None, nchan=None, use_bfloat16=True, manual=True, 
-                 freeze_backbone=True, learn_volcano=True, alpha=1.0, beta=0.1):
+                 freeze_backbone=True, hidden_dim=256):
 
         if diam_mean is not None:
             models_logger.warning("diam_mean argument is deprecated in this architecture.")
@@ -240,9 +218,7 @@ class CellposeModel():
 
         self.net = DualParasiteSwinNetwork(
             nchan=self.nchan, 
-            learn_volcano=learn_volcano, 
-            alpha=alpha, 
-            beta=beta
+            hidden_dim=hidden_dim
         ).to(self.device)
 
         if use_bfloat16 and self.gpu:
@@ -277,11 +253,6 @@ class CellposeModel():
             param.requires_grad = True
         for param in self.net.org_decoder.parameters():
             param.requires_grad = True
-
-        # Volcano parameters
-        for name, param in self.net.named_parameters():
-            if name in ['alpha', 'beta']:
-                param.requires_grad = getattr(self.net, 'learn_volcano', False)
 
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
