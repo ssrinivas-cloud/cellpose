@@ -177,7 +177,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               save_flows=False, visualize=False, debug=False, 
               unfreeze_schedule=[20, 5], test_result=10, normalize_loss=False, 
               turnoff_cell_loss=False, only_cell_loss=False, 
-              two_tail=False, cell_loss_coeff=1.0, org_loss_coeff=1.0, **kwargs):
+              two_tail=False, cell_loss_coeff=1.0, org_loss_coeff=1.0, 
+              use_cosine_annealing=False, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -194,15 +195,34 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     nimg = len(train_data)
     nimg_test = len(test_data) if test_data else 0
 
-    warmup_epochs = min(10, n_epochs // 10) 
-    cosine_epochs = max(0, n_epochs - warmup_epochs)
-    LR_warmup = np.linspace(0, learning_rate, warmup_epochs)
-    min_lr = learning_rate * 0.01 
-    LR_cosine = min_lr + 0.5 * (learning_rate - min_lr) * (1 + np.cos(np.pi * np.arange(cosine_epochs) / cosine_epochs)) if cosine_epochs > 0 else np.array([])
-    LR = np.concatenate([LR_warmup, LR_cosine])
+    # =================================================================
+    # LEARNING RATE SCHEDULE
+    # =================================================================
+    if use_cosine_annealing:
+        train_logger.info(">>> Using Cosine Annealing LR Schedule")
+        warmup_epochs = min(10, n_epochs // 10) 
+        cosine_epochs = max(0, n_epochs - warmup_epochs)
+        LR_warmup = np.linspace(0, learning_rate, warmup_epochs)
+        min_lr = learning_rate * 0.01 
+        LR_cosine = min_lr + 0.5 * (learning_rate - min_lr) * (1 + np.cos(np.pi * np.arange(cosine_epochs) / cosine_epochs)) if cosine_epochs > 0 else np.array([])
+        LR = np.concatenate([LR_warmup, LR_cosine])
+    else:
+        train_logger.info(">>> Using Default Step-Decay LR Schedule")
+        LR = np.linspace(0, learning_rate, 10) # 1. Linear warmup
+        LR = np.append(LR, learning_rate * np.ones(max(0, n_epochs - 10))) # 2. Constant phase
+
+        # 3. Step decay at the end
+        if n_epochs > 300:
+            LR = LR[:-100]
+            for i in range(10):
+                LR = np.append(LR, LR[-1] / 2 * np.ones(10)) # Halves the LR every 10 epochs
+        elif n_epochs > 99:
+            LR = LR[:-50]
+            for i in range(10):
+                LR = np.append(LR, LR[-1] / 2 * np.ones(5))  # Halves the LR every 5 epochs
     
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}, two_tail={two_tail}")
-    train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
+    train_logger.info(f">>> AdamW, max learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
     
     if turnoff_cell_loss and only_cell_loss:
         raise ValueError("You cannot have both 'turnoff_cell_loss' and 'only_cell_loss' set to True.")
