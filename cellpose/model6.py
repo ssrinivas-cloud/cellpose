@@ -126,8 +126,15 @@ class DualParasiteSwinNetwork(nn.Module):
         
         # 1. The Swin Backbone (Universal Feature Quarry)
         # Using base patch4 window7. Native feature dimensions: [128, 256, 512, 1024]
-        models_logger.info(f">>> Instantiating Swin-Base Backbone ({nchan} channels)...")
-        self.backbone = timm.create_model('swin_base_patch4_window7_224', in_chans=nchan, features_only=True, pretrained=True)
+        models_logger.info(f">>> Instantiating Swin-Base Backbone ({nchan} channels, Dynamic Interp 256x256)...")
+        self.backbone = timm.create_model(
+            'swin_base_patch4_window7_224', 
+            in_chans=nchan, 
+            features_only=True, 
+            pretrained=True,
+            img_size=256,             # Option 2: Explicitly interpolate to 256
+            dynamic_img_size=True     # Option 2: Allow dynamic window padding for safety
+        )
         
         # 2. The Cell Parasite (Hooks into deep semantics: Stages 4, 3, 2)
         # Stage 2 native resolution is 1/8, so final upsample is 8x
