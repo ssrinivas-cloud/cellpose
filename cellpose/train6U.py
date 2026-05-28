@@ -47,7 +47,10 @@ def dice_loss(pred_logits, target_mask, smooth=1e-5):
     dice = (2. * intersection + smooth) / (union + smooth)
     return 1.0 - dice
 
-def _loss_fn_seg(lbl, y, device, flow_weight=0.5, bce_weight=1.0, dice_weight=2.0, tv_weight=0.005):
+# =========================================================================
+# CRITICAL UPDATE: Split Probability / Flow computation toggle added
+# =========================================================================
+def _loss_fn_seg(lbl, y, device, flow_weight=0.5, bce_weight=1.0, dice_weight=2.0, tv_weight=0.005, compute_flows=True):
     criterion_mse = nn.MSELoss(reduction="mean")
     criterion_bce = nn.BCEWithLogitsLoss(reduction="mean")
     
@@ -57,22 +60,26 @@ def _loss_fn_seg(lbl, y, device, flow_weight=0.5, bce_weight=1.0, dice_weight=2.
     target_mask = (lbl[:, -3] > 0.5).to(y.dtype)
     pred_logits = y[:, -1]
     
-    # 1. Calculate base losses
-    loss_flow = criterion_mse(pred_flows, veci)
+    # 1. Calculate base probability losses (Always computed)
     loss_bce = criterion_bce(pred_logits, target_mask)
     loss_dice = dice_loss(pred_logits, target_mask)
-    
-    # 2. Calculate the smoothness penalty
-    loss_tv = total_variation_loss(pred_flows)
-    
-    # 3. Combine: Force the model to expand shapes using Dice (dice_weight=2.0)
     loss_prob_total = (loss_bce * bce_weight) + (loss_dice * dice_weight)
+    
+    # 2. Conditionally calculate flow and smoothness penalties
+    if compute_flows:
+        loss_flow = criterion_mse(pred_flows, veci)
+        loss_tv = total_variation_loss(pred_flows)
+    else:
+        loss_flow = torch.tensor(0.0, device=device)
+        loss_tv = torch.tensor(0.0, device=device)
+    
+    # 3. Combine
     total_loss = loss_prob_total + (loss_flow * flow_weight) + (loss_tv * tv_weight)
     
     return total_loss, loss_prob_total, loss_flow, loss_tv
 
 # =========================================================================
-# CRITICAL UPDATE: Organelles now use the Hybrid Dice + BCE Loss
+# Organelles Loss (Hybrid Dice + BCE Loss)
 # =========================================================================
 def _loss_fn_org(lbl, y, device, flow_weight=0.5, bce_weight=1.0, dice_weight=2.0):
     criterion_mse = nn.MSELoss(reduction="mean")
@@ -287,7 +294,13 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
             with torch.autocast(device_type=device.type, dtype=net.dtype):
                 outputs, style = net(X) 
-                y_cell, y_org = outputs
+                
+                # Gracefully unpack whether the network outputs 2 heads (cells, orgs) or 3 heads (cells, orgs, cell_predict)
+                y_cell_predict = None
+                if len(outputs) == 3:
+                    y_cell, y_org, y_cell_predict = outputs
+                else:
+                    y_cell, y_org = outputs
                 
                 # ==========================================================
                 # TRAINING PIPELINE SYSTEM & TENSOR TELEMETRY 
@@ -371,27 +384,46 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         axes[1, 2].axis('off')
                         
                         plt.tight_layout()
-                        # NOTE: For inline Jupyter Notebook viewing, you could add `plt.show()` here if desired.
-                        # Leaving as save-only for the training loop debug crops to prevent Jupyter from freezing up on huge epochs.
                         plt.savefig(save_path / f"debug_training_crop_epoch_{iepoch:04d}.png")
                         plt.close(fig)
                     except Exception as e:
                         train_logger.warning(f"Debug plotting failed: {e}")
 
                 if only_cell_loss:
-                    loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
+                    # Cell head computes probability only
+                    loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device, compute_flows=False)
+                    
+                    # Cell Predict head computes BOTH probability and flows (if present)
+                    if y_cell_predict is not None:
+                        loss_cp, l_prob_cp, l_flow_cp, l_tv_cp = _loss_fn_seg(L_c, y_cell_predict, device, compute_flows=True)
+                        loss_cell = loss_cell + loss_cp
+                        l_flow_c = l_flow_cp
+                        l_tv_c = l_tv_cp
+                        
                     loss = loss_cell / accumulation_steps
                     if debug and k == 0:
                         train_logger.info(f"[DEBUG-LOSS] CELL ONLY -> Total: {loss_cell.item():.4f} | Prob (BCE+Dice): {l_prob_c.item():.4f} | Flow: {l_flow_c.item():.4f} | TV: {l_tv_c.item():.4f}")
+                        
                 elif turnoff_cell_loss:
                     loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
                     loss = loss_org / accumulation_steps
                     if debug and k == 0:
                         train_logger.info(f"[DEBUG-LOSS] ORG ONLY -> Total: {loss_org.item():.4f} | Prob: {l_prob_o.item():.4f} | Flow: {l_flow_o.item():.4f}")
+                        
                 else:
-                    loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
+                    # Cell head computes probability only
+                    loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device, compute_flows=False)
+                    
+                    # Cell Predict head computes BOTH probability and flows (if present)
+                    if y_cell_predict is not None:
+                        loss_cp, l_prob_cp, l_flow_cp, l_tv_cp = _loss_fn_seg(L_c, y_cell_predict, device, compute_flows=True)
+                        loss_cell = loss_cell + loss_cp
+                        l_flow_c = l_flow_cp
+                        l_tv_c = l_tv_cp
+                        
                     loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
                     loss = (cell_loss_coeff*loss_cell + org_loss_coeff*loss_org) / accumulation_steps
+                    
                     if debug and k == 0:
                         train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell [Total:{loss_cell.item():.4f}, Prob:{l_prob_c.item():.4f}, Flow:{l_flow_c.item():.4f}] | Org [Total:{loss_org.item():.4f}]")
 
@@ -459,16 +491,30 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
                             outputs, style = net(X) 
-                            y_cell, y_org = outputs
+                            
+                            y_cell_predict = None
+                            if len(outputs) == 3:
+                                y_cell, y_org, y_cell_predict = outputs
+                            else:
+                                y_cell, y_org = outputs
                             
                             if only_cell_loss:
-                                loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
+                                loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device, compute_flows=False)
+                                if y_cell_predict is not None:
+                                    loss_cp, _, _, _ = _loss_fn_seg(L_c, y_cell_predict, device, compute_flows=True)
+                                    loss_c = loss_c + loss_cp
                                 loss = loss_c
+                                
                             elif turnoff_cell_loss:
                                 loss_o, _, _, _ = _loss_fn_org(L_o, y_org, device) 
                                 loss = loss_o
+                                
                             else:
-                                loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
+                                loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device, compute_flows=False)
+                                if y_cell_predict is not None:
+                                    loss_cp, _, _, _ = _loss_fn_seg(L_c, y_cell_predict, device, compute_flows=True)
+                                    loss_c = loss_c + loss_cp
+                                    
                                 loss_o, _, _, _ = _loss_fn_org(L_o, y_org, device) 
                                 loss = cell_loss_coeff*loss_c + org_loss_coeff*loss_o
                         
