@@ -8,7 +8,7 @@ import os
 import numpy as np
 import scipy.ndimage
 import matplotlib.pyplot as plt  
-from cellpose import io, utils, dynamics, model5  # <--- Updated to model5
+from cellpose import io, utils, dynamics, model6  # <--- Updated to model6
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
@@ -337,7 +337,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
             imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
             lbl_c_aug, lbl_o_aug = lbl_aug[:, :3, :, :], lbl_aug[:, 3:, :, :]
-                                                                                                                                    
+                                                                                                                        
             X = torch.from_numpy(imgi).to(device)
             L_c = torch.from_numpy(lbl_c_aug).to(device)
             L_o = torch.from_numpy(lbl_o_aug).to(device)
@@ -542,8 +542,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 temp_model_path = str(filename) + f"_eval_temp"
                 net.save_model(temp_model_path)
                 
-                # Updated to use model5.CellposeModel wrapper
-                eval_model = model5.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
+                # Updated to use model6.CellposeModel wrapper
+                eval_model = model6.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
                 
                 masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
                 pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
