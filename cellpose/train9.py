@@ -298,8 +298,14 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             with torch.autocast(device_type=device.type, dtype=net.dtype):
                 outputs, style = net(X) 
                 
-                # Unpack 3 heads
-                y_cell, y_org, y_cell_pred = outputs
+                # Dynamic Unpacking Logic to prevent ValueError
+                if len(outputs) == 3:
+                    y_cell, y_org, y_cell_pred = outputs
+                elif len(outputs) == 2:
+                    y_cell, y_org = outputs
+                    y_cell_pred = y_cell  # Fallback
+                else:
+                    raise ValueError(f"Expected 2 or 3 outputs from model, got {len(outputs)}")
                 
                 # ==========================================================
                 # TRAINING PIPELINE SYSTEM & TENSOR TELEMETRY 
@@ -462,8 +468,13 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
                             outputs, style = net(X) 
-                            y_cell, y_org, y_cell_pred = outputs
                             
+                            if len(outputs) == 3:
+                                y_cell, y_org, y_cell_pred = outputs
+                            elif len(outputs) == 2:
+                                y_cell, y_org = outputs
+                                y_cell_pred = y_cell
+                                
                             target_mask_c = (L_c[:, -3] > 0.5).to(y_cell.dtype)
                             pred_logits_c = y_cell[:, -1]
                             loss_cell_prob = focal_loss_with_logits(pred_logits_c, target_mask_c, alpha=0.25, gamma=2.0) + dice_loss(pred_logits_c, target_mask_c)
