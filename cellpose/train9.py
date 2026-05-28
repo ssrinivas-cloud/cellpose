@@ -227,7 +227,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         eff_org_coeff = org_loss_coeff
 
     # =================================================================
-    # PARAMETER FREEZE LOGIC
+    # PARAMETER FREEZE LOGIC (cell_predict tied to backbone)
     # =================================================================
     unfreeze_backbone = max(0, min(100, unfreeze_backbone))
     unfreeze_epoch = int((unfreeze_backbone / 100.0) * n_epochs)
@@ -236,20 +236,19 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
     if is_frozen:
         if unfreeze_epoch >= n_epochs:
-            train_logger.info(f"\n>>> [MODELS] Backbone will remain PERMANENTLY frozen (unfreeze_backbone={unfreeze_backbone}%).")
+            train_logger.info(f"\n>>> [MODELS] Backbone & cell_predict will remain PERMANENTLY frozen (unfreeze_backbone={unfreeze_backbone}%).")
         else:
-            train_logger.info(f"\n>>> [MODELS] Phase 1: Freezing ViT Backbone. Will unfreeze at Epoch {unfreeze_epoch} ({unfreeze_backbone}%).")
+            train_logger.info(f"\n>>> [MODELS] Phase 1: Freezing ViT Backbone & cell_predict. Will unfreeze at Epoch {unfreeze_epoch} ({unfreeze_backbone}%).")
     else:
         train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End from start (unfreeze_backbone=0%).")
 
     for name, param in net.named_parameters():
-        if any(x in name for x in ['cell_predict_neck', 'cell_predict_out']):
-            param.requires_grad = False
-        elif any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'organelle_transformer', 'intermediate_decoder', 'layer_attention']):
+        if any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'organelle_transformer', 'intermediate_decoder', 'layer_attention']):
             param.requires_grad = True
         elif name in ['alpha', 'beta']:
             param.requires_grad = getattr(net, 'learn_volcano', False)
         else:
+            # This implicitly ties cell_predict_neck and cell_predict_out to the encoder's is_frozen state
             param.requires_grad = not is_frozen
 
     trainable_params = filter(lambda p: p.requires_grad, net.parameters())
@@ -291,14 +290,16 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
             imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
             lbl_c_aug, lbl_o_aug = lbl_aug[:, :3, :, :], lbl_aug[:, 3:, :, :]
-                                                                                                                              
+                                                                                                                                    
             X = torch.from_numpy(imgi).to(device)
             L_c = torch.from_numpy(lbl_c_aug).to(device)
             L_o = torch.from_numpy(lbl_o_aug).to(device)
 
             with torch.autocast(device_type=device.type, dtype=net.dtype):
                 outputs, style = net(X) 
-                y_cell, y_org = outputs
+                
+                # Unpack 3 heads
+                y_cell, y_org, y_cell_pred = outputs
                 
                 # ==========================================================
                 # TRAINING PIPELINE SYSTEM & TENSOR TELEMETRY 
@@ -333,7 +334,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         cell_prob_map = torch.sigmoid(y_cell[0, -1]).detach().cpu().numpy()
                         org_prob_map = torch.sigmoid(y_org[0, -1]).detach().cpu().numpy()
                         
-                        c_flow_vis = np.clip((y_cell[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
+                        # Use y_cell_pred for plotting cell flows, since y_cell doesn't have structural flows anymore
+                        c_flow_vis = np.clip((y_cell_pred[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
                         o_flow_vis = np.clip((y_org[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
                         
                         c_flow_rgb = np.concatenate([c_flow_vis, np.zeros_like(c_flow_vis[..., :1])], axis=-1)
@@ -351,7 +353,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         fig.colorbar(im_prob_c, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
                         axes[0, 2].imshow(c_flow_rgb)
-                        axes[0, 2].set_title("Cells: Flow Vectors")
+                        axes[0, 2].set_title("Cells: Flow Vectors (cell_predict)")
                         axes[0, 2].axis('off')
 
                         axes[1, 0].imshow(img_o, cmap='gray')
@@ -374,22 +376,33 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     except Exception as e:
                         train_logger.warning(f"Debug plotting failed: {e}")
 
+                # ==========================================================
+                # LOSS CALCULATIONS
+                # ==========================================================
+                # 1. CELL HEAD LOSS: Probability Map Only
+                target_mask_c = (L_c[:, -3] > 0.5).to(y_cell.dtype)
+                pred_logits_c = y_cell[:, -1]
+                loss_cell_prob = focal_loss_with_logits(pred_logits_c, target_mask_c, alpha=0.25, gamma=2.0) + dice_loss(pred_logits_c, target_mask_c)
+                
+                # 2. CELL PREDICT HEAD LOSS: Both Prob & Flow
+                loss_cell_pred, l_prob_cp, l_flow_cp, l_tv_cp = _loss_fn_seg(L_c, y_cell_pred, device)
+                
+                # 3. ORGANELLE HEAD LOSS: Both Prob & Flow
+                loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
+
                 if only_cell_loss:
-                    loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
-                    loss = loss_cell / accumulation_steps
+                    loss = (loss_cell_prob + loss_cell_pred) / accumulation_steps
                     if debug and k == 0:
-                        train_logger.info(f"[DEBUG-LOSS] CELL ONLY -> Total: {loss_cell.item():.4f} | Prob (Focal+Dice): {l_prob_c.item():.4f} | Flow: {l_flow_c.item():.4f} | TV: {l_tv_c.item():.4f}")
+                        train_logger.info(f"[DEBUG-LOSS] CELL ONLY -> Prob Map Loss: {loss_cell_prob.item():.4f} | Cell Predict Total: {loss_cell_pred.item():.4f}")
                 elif turnoff_cell_loss:
-                    loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
                     loss = loss_org / accumulation_steps
                     if debug and k == 0:
                         train_logger.info(f"[DEBUG-LOSS] ORG ONLY -> Total: {loss_org.item():.4f} | Prob: {l_prob_o.item():.4f} | Flow: {l_flow_o.item():.4f}")
                 else:
-                    loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
-                    loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
-                    loss = (eff_cell_coeff*loss_cell + eff_org_coeff*loss_org) / accumulation_steps
+                    total_cell_branch = loss_cell_prob + loss_cell_pred
+                    loss = (eff_cell_coeff * total_cell_branch + eff_org_coeff * loss_org) / accumulation_steps
                     if debug and k == 0:
-                        train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell [Total:{loss_cell.item():.4f}, Prob:{l_prob_c.item():.4f}, Flow:{l_flow_c.item():.4f}] | Org [Total:{loss_org.item():.4f}]")
+                        train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell [Prob Only:{loss_cell_prob.item():.4f}, Predict Head Total:{loss_cell_pred.item():.4f}] | Org [Total:{loss_org.item():.4f}]")
 
 
             scaler.scale(loss).backward()
@@ -414,11 +427,11 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         # AUTO-UNFREEZE TRIGGER
         # =================================================================
         if is_frozen and iepoch >= unfreeze_epoch and unfreeze_epoch < n_epochs:
-            train_logger.info(f"\n>>> [AUTO-UNFREEZE] Milestone Reached (Epoch {iepoch}/{n_epochs} - {unfreeze_backbone}%). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
+            train_logger.info(f"\n>>> [AUTO-UNFREEZE] Milestone Reached (Epoch {iepoch}/{n_epochs} - {unfreeze_backbone}%). UNFREEZING WHOLE BACKBONE & CELL_PREDICT FOR FINE-TUNING!")
             
             newly_unfrozen_params = []
             for name, param in net.named_parameters(): 
-                if not param.requires_grad and 'cell_predict' not in name:
+                if not param.requires_grad:
                     param.requires_grad = True
                     newly_unfrozen_params.append(param)
             
@@ -449,18 +462,22 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
                             outputs, style = net(X) 
-                            y_cell, y_org = outputs
+                            y_cell, y_org, y_cell_pred = outputs
+                            
+                            target_mask_c = (L_c[:, -3] > 0.5).to(y_cell.dtype)
+                            pred_logits_c = y_cell[:, -1]
+                            loss_cell_prob = focal_loss_with_logits(pred_logits_c, target_mask_c, alpha=0.25, gamma=2.0) + dice_loss(pred_logits_c, target_mask_c)
+                            
+                            loss_cell_pred, _, _, _ = _loss_fn_seg(L_c, y_cell_pred, device)
+                            loss_org, _, _, _ = _loss_fn_org(L_o, y_org, device) 
                             
                             if only_cell_loss:
-                                loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
-                                loss = loss_c
+                                loss = loss_cell_prob + loss_cell_pred
                             elif turnoff_cell_loss:
-                                loss_o, _, _, _ = _loss_fn_org(L_o, y_org, device) 
-                                loss = loss_o
+                                loss = loss_org
                             else:
-                                loss_c, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
-                                loss_o, _, _, _ = _loss_fn_org(L_o, y_org, device) 
-                                loss = eff_cell_coeff*loss_c + eff_org_coeff*loss_o
+                                total_cell_branch = loss_cell_prob + loss_cell_pred
+                                loss = eff_cell_coeff * total_cell_branch + eff_org_coeff * loss_org
                         
                         lavgt += loss.item() * len(imgi)
                 lavgt /= nimg_test
