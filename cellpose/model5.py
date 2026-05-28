@@ -73,11 +73,6 @@ def get_user_models():
 # =================================================================
 
 class CrossLayerAttentionConcat(nn.Module):
-    """
-    Treats the L different layers as a sequence of L tokens for each spatial pixel.
-    Applies Self-Attention across the layers to let them communicate,
-    then concatenates the attended features and fuses them.
-    """
     def __init__(self, embed_dim=1024, num_layers=5, num_heads=8):
         super().__init__()
         self.num_layers = num_layers
@@ -107,13 +102,8 @@ class CrossLayerAttentionConcat(nn.Module):
 
 
 class LocalTokenMixer(nn.Module):
-    """ 
-    Replaces heavy global self-attention with ConvNeXt-style depthwise spatial mixing.
-    Linear scaling O(N), much faster, and better at preserving sharp local gradients. 
-    """
     def __init__(self, dim=1024, mlp_ratio=4.0):
         super().__init__()
-        # 7x7 Depthwise convolution for local spatial token mixing
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
         self.norm = nn.LayerNorm(dim)
         self.pw1 = nn.Linear(dim, int(dim * mlp_ratio))
@@ -121,14 +111,12 @@ class LocalTokenMixer(nn.Module):
         self.pw2 = nn.Linear(int(dim * mlp_ratio), dim)
 
     def forward(self, x):
-        # x is (B, L, C). We need spatial (B, C, H, W) for dwconv
         B, L, C = x.shape
         H = W = int(math.sqrt(L))
         
         spatial = x.transpose(1, 2).view(B, C, H, W)
         spatial = self.dwconv(spatial)
         
-        # Flatten back to sequence for MLP channel mixing
         mixed = spatial.flatten(2).transpose(1, 2)
         
         out = self.norm(mixed)
@@ -139,14 +127,9 @@ class LocalTokenMixer(nn.Module):
 
 
 class TightLocalExtractor(nn.Module):
-    """ 
-    ASPP tightened to small dilations (1, 2, 3) to catch sub-10px objects.
-    Uses Depthwise Separable convolutions to slash compute overhead.
-    """
     def __init__(self, embed_dim=1024):
         super().__init__()
         
-        # Helper for Depthwise Separable Block
         def dw_block(dilation, padding):
             return nn.Sequential(
                 nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=padding, dilation=dilation, groups=embed_dim, bias=False),
@@ -156,8 +139,8 @@ class TightLocalExtractor(nn.Module):
             )
             
         self.branch1 = dw_block(dilation=1, padding=1)
-        self.branch2 = dw_block(dilation=2, padding=2) # Tighter!
-        self.branch3 = dw_block(dilation=3, padding=3) # Tighter!
+        self.branch2 = dw_block(dilation=2, padding=2)
+        self.branch3 = dw_block(dilation=3, padding=3)
         
         self.branch4 = nn.Sequential(
             nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=1, bias=False),
@@ -169,6 +152,7 @@ class TightLocalExtractor(nn.Module):
             nn.BatchNorm2d(embed_dim),
             nn.ReLU(inplace=True)
         )
+        
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
@@ -181,39 +165,79 @@ class TightLocalExtractor(nn.Module):
         return x + self.gamma * mixed
 
 
-class HybridOrganelleTransformer(nn.Module):
-    """ Alternates between LocalTokenMixer Blocks and TightLocalExtractor blocks """
-    def __init__(self, embed_dim=1024, depth=3, num_heads=16, mlp_ratio=4.0, use_aspp=False):
+class StandardTransformerBlock(nn.Module):
+    """ True global self-attention block """
+    def __init__(self, dim=1024, num_heads=8, mlp_ratio=4.0):
         super().__init__()
-        self.depth = depth
-        self.use_aspp = use_aspp
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         
-        self.transformer_blocks = nn.ModuleList([
-            LocalTokenMixer(dim=embed_dim, mlp_ratio=mlp_ratio)
-            for _ in range(depth)
-        ])
-        
-        if self.use_aspp:
-            self.aspp_blocks = nn.ModuleList([
-                TightLocalExtractor(embed_dim=embed_dim)
-                for _ in range(depth - 1)
-            ])
-            
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Linear(int(dim * mlp_ratio), dim)
+        )
 
     def forward(self, x):
         B, C, H, W = x.shape
-        for i in range(self.depth):
-            x_seq = x.view(B, C, -1).transpose(1, 2)
-            x_seq = self.transformer_blocks[i](x_seq)
-            x = x_seq.transpose(1, 2).view(B, C, H, W).contiguous()
-            
-            if self.use_aspp and i < (self.depth - 1):
-                x = self.aspp_blocks[i](x)
-                
         x_seq = x.view(B, C, -1).transpose(1, 2)
-        x_seq = self.norm(x_seq)
+
+        x_norm = self.norm1(x_seq)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x_seq = x_seq + attn_out
+
+        x_seq = x_seq + self.mlp(self.norm2(x_seq))
+
         return x_seq.transpose(1, 2).view(B, C, H, W).contiguous()
+
+
+class HybridOrganelleTransformer(nn.Module):
+    """ 
+    Wraps TightLocalExtractor and LocalTokenMixer around true Transformer blocks.
+    Features dense internal residuals and an external ViT backbone residual.
+    """
+    def __init__(self, embed_dim=1024, num_blocks=2, num_heads=8, mlp_ratio=4.0):
+        super().__init__()
+        self.num_blocks = num_blocks
+        
+        self.extractors = nn.ModuleList([TightLocalExtractor(embed_dim) for _ in range(num_blocks)])
+        self.mixers = nn.ModuleList([LocalTokenMixer(dim=embed_dim, mlp_ratio=mlp_ratio) for _ in range(num_blocks)])
+        self.transformers = nn.ModuleList([StandardTransformerBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio) for _ in range(num_blocks)])
+        
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x, vit_residual=None):
+        B, C, H, W = x.shape
+        out = x
+
+        for i in range(self.num_blocks):
+            block_input = out 
+
+            # 1. Multi-scale tight boundaries
+            out = self.extractors[i](out)
+
+            # 2. Local spatial token mixing
+            out_seq = out.view(B, C, -1).transpose(1, 2)
+            out_seq = self.mixers[i](out_seq)
+            out = out_seq.transpose(1, 2).view(B, C, H, W).contiguous()
+
+            # 3. Global Self-Attention
+            out = self.transformers[i](out)
+
+            # 4. Dense Macro-Residual Connection
+            out = block_input + out
+
+        # Final sequence norm
+        out_seq = out.view(B, C, -1).transpose(1, 2)
+        out_seq = self.norm(out_seq)
+        out = out_seq.transpose(1, 2).view(B, C, H, W).contiguous()
+
+        # 5. Residual Connection directly from the ViT Encoder
+        if vit_residual is not None:
+            out = out + vit_residual
+
+        return out
 
 
 class IntermediateDecoder(nn.Module):
@@ -245,7 +269,6 @@ class DualPathTransformer(nn.Module):
         self.diam_mean = getattr(base_net, 'diam_mean', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         
-        # Shifted early to retain high-res spatial features for organelles
         self.target_layers = [2, 4, 6, 8, 10]
         self.intermediate_features = {}
         
@@ -261,7 +284,8 @@ class DualPathTransformer(nn.Module):
         self.cell_predict_out = copy.deepcopy(base_net.out)
         
         self.layer_attention_concat = CrossLayerAttentionConcat(embed_dim=1024, num_layers=len(self.target_layers)).to(self._true_dtype)
-        self.organelle_transformer = HybridOrganelleTransformer(embed_dim=1024, depth=3, use_aspp=use_aspp).to(self._true_dtype)
+        # Initialize the 2-block architecture
+        self.organelle_transformer = HybridOrganelleTransformer(embed_dim=1024, num_blocks=2).to(self._true_dtype)
         self.intermediate_decoder = IntermediateDecoder(embed_dim=1024).to(self._true_dtype)
         
         self.org_neck = copy.deepcopy(base_net.encoder.neck)
@@ -336,7 +360,6 @@ class DualPathTransformer(nn.Module):
 
     def apply_volcano_merger(self, out_c):
         import torchvision.transforms.functional as TF
-        import torch.nn.functional as F
         
         cell_flows = out_c[:, :2, :, :]
         cell_logits = out_c[:, 2:, :, :]
@@ -386,7 +409,11 @@ class DualPathTransformer(nn.Module):
         
         spatial_features = [self._reshape_to_spatial(self.intermediate_features[i]) for i in self.target_layers]
         fused_early = self.layer_attention_concat(spatial_features)
-        transformed_early = self.organelle_transformer(fused_early)
+        
+        # Grab ViT residual (Layer 10) and pass to Organelle path
+        vit_encoder_residual = spatial_features[-1]
+        transformed_early = self.organelle_transformer(fused_early, vit_residual=vit_encoder_residual)
+        
         decoded_early = self.intermediate_decoder(transformed_early)
         
         feat_o = self.org_neck(decoded_early)
