@@ -481,9 +481,36 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         if debug and test_data:
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
-            eval_model = model3.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
+            eval_nchan = 6 if two_tail else 3
+            eval_model = model3.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=eval_nchan)
             
-            masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
+            # PRE-FORMAT FOR EVAL: Cellpose's internal eval doesn't auto-pad to 3/6 channels for custom architectures.
+            test_data_eval = []
+            for img in test_data:
+                img_eval = img.copy()
+                # If 2D (Y, X), add channel dim -> (Y, X, 1)
+                if img_eval.ndim == 2:
+                    img_eval = img_eval[..., np.newaxis]
+                # If (C, Y, X), transpose -> (Y, X, C) for Cellpose eval
+                elif img_eval.ndim == 3 and img_eval.shape[0] <= 3:
+                    img_eval = img_eval.transpose(1, 2, 0)
+                    
+                # Pad dynamically to match model's expected nchan
+                if img_eval.shape[-1] == 1:
+                    if two_tail:
+                        img_eval = np.repeat(img_eval, 6, axis=-1)
+                    else:
+                        img_eval = np.concatenate([img_eval, np.zeros_like(img_eval), np.zeros_like(img_eval)], axis=-1)
+                elif img_eval.shape[-1] == 2:
+                    if two_tail:
+                        img_eval = np.concatenate([np.repeat(img_eval[..., 0:1], 3, axis=-1), np.repeat(img_eval[..., 1:2], 3, axis=-1)], axis=-1)
+                    else:
+                        img_eval = np.concatenate([img_eval, np.zeros_like(img_eval[..., 0:1])], axis=-1)
+                        
+                test_data_eval.append(img_eval)
+
+            # Pass channels=None so it doesn't try to strip our manually padded channels
+            masks_both, _, _ = eval_model.eval(test_data_eval, batch_size=2, channels=None, cellprob_threshold=0.0, rescale=1.0, active_head='both')
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
             gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
             
