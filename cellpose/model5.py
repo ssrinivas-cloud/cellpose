@@ -69,7 +69,7 @@ def get_user_models():
 
 
 # =================================================================
-# HYBRID ORGANELLE MODULES (Cross-Layer Attn + ASPP + Transformer)
+# EFFICIENT HYBRID ORGANELLE MODULES
 # =================================================================
 
 class CrossLayerAttentionConcat(nn.Module):
@@ -81,11 +81,9 @@ class CrossLayerAttentionConcat(nn.Module):
     def __init__(self, embed_dim=1024, num_layers=5, num_heads=8):
         super().__init__()
         self.num_layers = num_layers
-        # Self-Attention across the layers
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(embed_dim)
         
-        # Attention-based concat reduction
         self.fusion_conv = nn.Sequential(
             nn.Conv2d(embed_dim * num_layers, embed_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(embed_dim),
@@ -93,74 +91,74 @@ class CrossLayerAttentionConcat(nn.Module):
         )
 
     def forward(self, features):
-        # features: list of L tensors of shape (B, C, H, W)
         B, C, H, W = features[0].shape
-        
-        # Stack to (B, L, C, H, W)
         stacked = torch.stack(features, dim=1)
         
-        # Rearrange to treat each pixel as a batch element with sequence length L
-        # (B, L, C, H, W) -> (B, H, W, L, C) -> (B*H*W, L, C)
         x = stacked.permute(0, 3, 4, 1, 2).reshape(B * H * W, self.num_layers, C)
         
-        # Cross-Layer Self-Attention!
         x_norm = self.norm(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + attn_out # Residual connection
+        x = x + attn_out
         
-        # Reshape back to spatial multi-layer: (B*H*W, L, C) -> (B, H, W, L, C) -> (B, L, C, H, W)
         x = x.view(B, H, W, self.num_layers, C).permute(0, 3, 4, 1, 2)
-        
-        # Attention-based CONCAT! (B, L*C, H, W)
         x_concat = x.reshape(B, self.num_layers * C, H, W)
         
-        # Fuse back down to (B, C, H, W)
         return self.fusion_conv(x_concat)
 
 
-class TransformerBlock(nn.Module):
-    """ Standard Multi-Head Self Attention + MLP Block """
-    def __init__(self, dim=1024, num_heads=16, mlp_ratio=4.0):
+class LocalTokenMixer(nn.Module):
+    """ 
+    Replaces heavy global self-attention with ConvNeXt-style depthwise spatial mixing.
+    Linear scaling O(N), much faster, and better at preserving sharp local gradients. 
+    """
+    def __init__(self, dim=1024, mlp_ratio=4.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        hidden_features = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden_features),
-            nn.GELU(),
-            nn.Linear(hidden_features, dim)
-        )
+        # 7x7 Depthwise convolution for local spatial token mixing
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.LayerNorm(dim)
+        self.pw1 = nn.Linear(dim, int(dim * mlp_ratio))
+        self.act = nn.GELU()
+        self.pw2 = nn.Linear(int(dim * mlp_ratio), dim)
 
     def forward(self, x):
-        # x expected shape: (B, L, C)
-        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
-        x = x + attn_out
-        x = x + self.mlp(self.norm2(x))
-        return x
+        # x is (B, L, C). We need spatial (B, C, H, W) for dwconv
+        B, L, C = x.shape
+        H = W = int(math.sqrt(L))
+        
+        spatial = x.transpose(1, 2).view(B, C, H, W)
+        spatial = self.dwconv(spatial)
+        
+        # Flatten back to sequence for MLP channel mixing
+        mixed = spatial.flatten(2).transpose(1, 2)
+        
+        out = self.norm(mixed)
+        out = self.pw1(out)
+        out = self.act(out)
+        out = self.pw2(out)
+        return x + out
 
 
-class DilatedLocalExtractor(nn.Module):
+class TightLocalExtractor(nn.Module):
     """ 
-    ASPP Block using Dilated Convolutions to process local high-frequency details.
+    ASPP tightened to small dilations (1, 2, 3) to catch sub-10px objects.
+    Uses Depthwise Separable convolutions to slash compute overhead.
     """
     def __init__(self, embed_dim=1024):
         super().__init__()
-        self.branch1 = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, padding=1, dilation=1, bias=False),
-            nn.BatchNorm2d(embed_dim // 4),
-            nn.ReLU(inplace=True)
-        )
-        self.branch2 = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, padding=3, dilation=3, bias=False),
-            nn.BatchNorm2d(embed_dim // 4),
-            nn.ReLU(inplace=True)
-        )
-        self.branch3 = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, padding=5, dilation=5, bias=False),
-            nn.BatchNorm2d(embed_dim // 4),
-            nn.ReLU(inplace=True)
-        )
+        
+        # Helper for Depthwise Separable Block
+        def dw_block(dilation, padding):
+            return nn.Sequential(
+                nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=padding, dilation=dilation, groups=embed_dim, bias=False),
+                nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=1, bias=False),
+                nn.BatchNorm2d(embed_dim // 4),
+                nn.ReLU(inplace=True)
+            )
+            
+        self.branch1 = dw_block(dilation=1, padding=1)
+        self.branch2 = dw_block(dilation=2, padding=2) # Tighter!
+        self.branch3 = dw_block(dilation=3, padding=3) # Tighter!
+        
         self.branch4 = nn.Sequential(
             nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=1, bias=False),
             nn.BatchNorm2d(embed_dim // 4),
@@ -174,7 +172,6 @@ class DilatedLocalExtractor(nn.Module):
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
-        # x is spatial: (B, C, H, W)
         b1 = self.branch1(x)
         b2 = self.branch2(x)
         b3 = self.branch3(x)
@@ -185,21 +182,20 @@ class DilatedLocalExtractor(nn.Module):
 
 
 class HybridOrganelleTransformer(nn.Module):
-    """ Alternates between Transformer Blocks and ASPP blocks if ASPP=True """
+    """ Alternates between LocalTokenMixer Blocks and TightLocalExtractor blocks """
     def __init__(self, embed_dim=1024, depth=3, num_heads=16, mlp_ratio=4.0, use_aspp=False):
         super().__init__()
         self.depth = depth
         self.use_aspp = use_aspp
         
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+            LocalTokenMixer(dim=embed_dim, mlp_ratio=mlp_ratio)
             for _ in range(depth)
         ])
         
         if self.use_aspp:
-            # We insert ASPP between the transformers (so depth-1 ASPP blocks)
             self.aspp_blocks = nn.ModuleList([
-                DilatedLocalExtractor(embed_dim=embed_dim)
+                TightLocalExtractor(embed_dim=embed_dim)
                 for _ in range(depth - 1)
             ])
             
@@ -207,25 +203,17 @@ class HybridOrganelleTransformer(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        
         for i in range(self.depth):
-            # 1. To Sequence Format for Transformer
             x_seq = x.view(B, C, -1).transpose(1, 2)
             x_seq = self.transformer_blocks[i](x_seq)
-            
-            # 2. Back to Spatial Format
             x = x_seq.transpose(1, 2).view(B, C, H, W).contiguous()
             
-            # 3. Apply ASPP if enabled AND we are between transformers
             if self.use_aspp and i < (self.depth - 1):
                 x = self.aspp_blocks[i](x)
                 
-        # Final Norm
         x_seq = x.view(B, C, -1).transpose(1, 2)
         x_seq = self.norm(x_seq)
-        x = x_seq.transpose(1, 2).view(B, C, H, W).contiguous()
-        
-        return x
+        return x_seq.transpose(1, 2).view(B, C, H, W).contiguous()
 
 
 class IntermediateDecoder(nn.Module):
@@ -249,12 +237,6 @@ class IntermediateDecoder(nn.Module):
 # =================================================================
 
 class DualPathTransformer(nn.Module):
-    """
-    Wraps the ViT backbone to securely branch outputs into three heads:
-    1. cell_head (trainable)
-    2. cell_predict (frozen eval anchor)
-    3. organelle (trainable early-hook fusion via CrossLayerAttentionConcat -> HybridTransformer)
-    """
     def __init__(self, base_net, randomize_org=False, learn_volcano=True, alpha=1.0, beta=0.1, use_aspp=False):
         super().__init__()
         self.base_net = base_net
@@ -263,10 +245,8 @@ class DualPathTransformer(nn.Module):
         self.diam_mean = getattr(base_net, 'diam_mean', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         self.diam_labels = getattr(base_net, 'diam_labels', nn.Parameter(torch.tensor([30.0], dtype=self._true_dtype)))
         
-        # ---------------------------------------------------
-        # 0. SETUP HOOKS FOR EARLY LAYERS (ORGANELLE PATH)
-        # ---------------------------------------------------
-        self.target_layers = [4, 6, 8, 10, 12]
+        # Shifted early to retain high-res spatial features for organelles
+        self.target_layers = [2, 4, 6, 8, 10]
         self.intermediate_features = {}
         
         for layer_idx in self.target_layers:
@@ -274,21 +254,12 @@ class DualPathTransformer(nn.Module):
                 self._get_hook(layer_idx)
             )
             
-        # ===================================================
-        # HEAD 1: CELL HEAD (TRAINING)
-        # ===================================================
         self.cell_neck = copy.deepcopy(base_net.encoder.neck)
         self.cell_out = copy.deepcopy(base_net.out)
         
-        # ===================================================
-        # HEAD 2: CELL PREDICT HEAD (EVALUATION / FROZEN)
-        # ===================================================
         self.cell_predict_neck = copy.deepcopy(base_net.encoder.neck)
         self.cell_predict_out = copy.deepcopy(base_net.out)
         
-        # ===================================================
-        # HEAD 3: ORGANELLE HEAD
-        # ===================================================
         self.layer_attention_concat = CrossLayerAttentionConcat(embed_dim=1024, num_layers=len(self.target_layers)).to(self._true_dtype)
         self.organelle_transformer = HybridOrganelleTransformer(embed_dim=1024, depth=3, use_aspp=use_aspp).to(self._true_dtype)
         self.intermediate_decoder = IntermediateDecoder(embed_dim=1024).to(self._true_dtype)
@@ -307,13 +278,10 @@ class DualPathTransformer(nn.Module):
                     nn.init.kaiming_normal_(m.weight)
                     if m.bias is not None: nn.init.constant_(m.bias, 0)
         
-        # Disconnect original components to prevent accidental usage
         self.base_net.encoder.neck = nn.Identity()
         self.base_net.out = nn.Identity()
-        
         self.active_head = 'both'
 
-        # ---> VOLCANO MERGER PARAMETERS <---
         self.learn_volcano = learn_volcano
         if self.learn_volcano:
             self.alpha = nn.Parameter(torch.tensor([float(alpha)], dtype=self._true_dtype))
@@ -330,7 +298,6 @@ class DualPathTransformer(nn.Module):
         return hook
 
     def _reshape_to_spatial(self, x):
-        """Converts arbitrary ViT outputs to standard spatial format (B, C, H, W)"""
         if x.ndim == 4 and x.shape[1] == 1024:
             return x
         if x.ndim == 4 and x.shape[-1] == 1024:
@@ -361,7 +328,6 @@ class DualPathTransformer(nn.Module):
         torch.save(self.state_dict(), path)
 
     def pixel_shuffle(self, x):
-        """ Recreates Cellpose's hidden 8x upsampling reshape (192 -> 3 channels) """
         B, C, H, W = x.shape
         out_c = C // 64 
         x = x.view(B, out_c, 8, 8, H, W)
@@ -369,7 +335,6 @@ class DualPathTransformer(nn.Module):
         return x.view(B, out_c, H * 8, W * 8)
 
     def apply_volcano_merger(self, out_c):
-        """ Dynamically blends probability gradients into the vector flows """
         import torchvision.transforms.functional as TF
         import torch.nn.functional as F
         
@@ -395,66 +360,39 @@ class DualPathTransformer(nn.Module):
         return torch.cat([merged_flows, cell_logits], dim=1)
 
     def forward(self, x):
-        # Clear out hook cache and set dtype
         self.intermediate_features.clear()
         x = x.to(self._true_dtype)
         
-        # ========================================
-        # CELL PATHWAY (TRAIN vs EVAL ROUTING)
-        # ========================================
         if self.training:
-            # --- TRAINING: Single Pass via cell_head ---
             final_vit_out = self.base_net.encoder(x) 
             feat_c = self.cell_neck(final_vit_out)
             out_c = self.pixel_shuffle(self.cell_out(feat_c))
         else:
-            # --- EVALUATION: Two-Pass Feedback Loop ---
-            
-            # PASS 1: Generate Probability Map from cell_head
             vit_out_pass1 = self.base_net.encoder(x)
             feat_c_pass1 = self.cell_neck(vit_out_pass1)
             out_c_pass1 = self.pixel_shuffle(self.cell_out(feat_c_pass1))
             
-            # Extract probability map (Logits are exactly at channel 2)
             prob_map = torch.sigmoid(out_c_pass1[:, 2:3, :, :])
-            
-            # FEEDBACK: Modulate original input with the probability map
-            # Broadcasting natively handles (B, C, H, W) * (B, 1, H, W)
             x_feedback = x * prob_map
             
-            # Clear hooks before the second pass so organelles use the final feedback features
             self.intermediate_features.clear()
-            
-            # PASS 2: Feed back into the model
             final_vit_out = self.base_net.encoder(x_feedback)
             
-            # Predict via frozen cell_predict head
             feat_c = self.cell_predict_neck(final_vit_out)
             out_c = self.pixel_shuffle(self.cell_predict_out(feat_c))
             
         out_c = self.apply_volcano_merger(out_c) 
         style_c = torch.mean(feat_c, dim=(2, 3))
         
-        # ========================================
-        # ORGANELLE PATHWAY 
-        # ========================================
-        # 1. Gather early features from hooks and ensure they are spatial (B, C, H, W)
         spatial_features = [self._reshape_to_spatial(self.intermediate_features[i]) for i in self.target_layers]
-        
-        # 2. Fuse via Cross-Layer Attention Concat
         fused_early = self.layer_attention_concat(spatial_features)
-        
-        # 3. Pass through the Hybrid Transformer (alternates Transformer / ASPP)
         transformed_early = self.organelle_transformer(fused_early)
-        
-        # 4. Final convolutional decoding
         decoded_early = self.intermediate_decoder(transformed_early)
         
         feat_o = self.org_neck(decoded_early)
         out_o = self.pixel_shuffle(self.org_out(feat_o))
         style_o = torch.mean(feat_o, dim=(2, 3))
 
-        # Routing logic
         if self.active_head == 'cells':
             return out_c, style_c
         elif self.active_head == 'organelles':
@@ -464,22 +402,6 @@ class DualPathTransformer(nn.Module):
 
 
 class CellposeModel():
-    """
-    Class representing a Cellpose model.
-
-    Attributes:
-        diam_mean (float): Mean "diameter" value for the model.
-        builtin (bool): Whether the model is a built-in model or not.
-        device (torch device): Device used for model running / training.
-        nclasses (int): Number of classes in the model.
-        nbase (list): List of base values for the model.
-        net (CPnet): Cellpose network.
-        pretrained_model (str): Path to pretrained cellpose model.
-        pretrained_model_ortho (str): Path or model_name for pretrained cellpose model for ortho views in 3D.
-        backbone (str): Type of network ("default" is the standard res-unet, "transformer" for the segformer).
-        freeze_backbone (bool): Whether the ViT backbone is frozen for head-only fine-tuning.
-    """
-
     def __init__(self, gpu=False, pretrained_model="cpsam", custom_weights=None, model_type=None,
                  diam_mean=None, device=None, nchan=None, use_bfloat16=True, manual=True, 
                  freeze_backbone=False, random=False, learn_volcano=True, alpha=1.0, beta=0.1, ASPP=False):
@@ -489,13 +411,10 @@ class CellposeModel():
         if model_type is not None:
             models_logger.warning("model_type argument is not used in v4.0.1+. Ignoring this argument...")
         
-        # Default to 3 channels (RGB mode), train.py will pass 6 if two_tail=True
         if nchan is None:
             nchan = 3
             
         self.nchan = nchan
-
-        ### assign model device
         self.device = assign_device(gpu=gpu)[0] if device is None else device
         if torch.cuda.is_available():
             device_gpu = self.device.type == "cuda"
@@ -508,7 +427,6 @@ class CellposeModel():
         if pretrained_model is None and custom_weights is None:
             raise ValueError("Must specify a pretrained model, training from scratch is not implemented")
         
-        ### check for pretrained model
         if pretrained_model and not os.path.exists(pretrained_model):
             model_strings = get_user_models()
             all_models = MODEL_NAMES.copy()
@@ -522,10 +440,8 @@ class CellposeModel():
         self.pretrained_model = pretrained_model
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
         
-        # 1. Initialize Base Network (3 channels)
         base_net = Transformer(dtype=dtype).to(self.device)
 
-        # 2. Load Pretrained CPSAM backbone FIRST so we can clone its 3-channel weights
         if not (custom_weights is not None and os.path.exists(custom_weights)):
             if os.path.exists(self.pretrained_model):
                 models_logger.info(f">>>> loading base model {self.pretrained_model}")
@@ -536,9 +452,6 @@ class CellposeModel():
                 cache_CPSAM_model_path()
                 base_net.load_model(self.pretrained_model, device=self.device)
 
-        # =================================================================
-        # 3. DYNAMIC INPUT CHANNEL MODIFICATION (6-channel switch)
-        # =================================================================
         if self.nchan != 3:
             models_logger.info(f"Modifying input patch_embed from 3 to {self.nchan} channels...")
             patch_embed = base_net.encoder.patch_embed
@@ -553,13 +466,9 @@ class CellposeModel():
                         bias=(layer.bias is not None)
                     )
                     with torch.no_grad():
-                        # Divide weights by 2 so adding them together doesn't blow up gradients
                         half_weight = layer.weight.clone() / 2.0
-                        
-                        # Apply to channels 0,1,2 (Cells) and 3,4,5 (Organelles)
                         new_conv.weight[:, :3, :, :] = half_weight
                         new_conv.weight[:, 3:, :, :] = half_weight
-                        
                         if layer.bias is not None:
                             new_conv.bias.copy_(layer.bias)
                             
@@ -568,7 +477,6 @@ class CellposeModel():
                     models_logger.info(f"Input {self.nchan}-channel modification complete!")
                     break
 
-        # 4. Wrap in DualPath Architecture
         if not manual or custom_weights is not None:
             models_logger.info("Injecting DualPathTransformer (Branching Cell at End, Organelles from Early Hooks)...")
             self.net = DualPathTransformer(
@@ -584,20 +492,14 @@ class CellposeModel():
 
         self.freeze_backbone = freeze_backbone
 
-        # 5. If resuming training from Custom Weights, load them NOW
         if custom_weights is not None and os.path.exists(custom_weights):
             models_logger.info(f">>>> loading CUSTOM post-architectural weights {custom_weights}")
             self.net.load_model(custom_weights, device=self.device)
 
-        # --- APPLY FREEZE SETTING ---
         self.set_freeze_backbone(self.freeze_backbone)
         
 
     def set_freeze_backbone(self, freeze=True):
-        """
-        Dynamically freezes or unfreezes the ViT backbone.
-        The deep dual-decoder paths and intermediate fusions will ALWAYS remain unfrozen.
-        """
         self.freeze_backbone = freeze
         if freeze:
             models_logger.info("\n>>> [MODELS] FREEZING BACKBONE: Only the Dual Decoder Paths will be trained.")
@@ -605,16 +507,14 @@ class CellposeModel():
             models_logger.info("\n>>> [MODELS] UNFREEZING BACKBONE: The entire network will be trained (End-to-End).")
             
         for name, param in self.net.named_parameters():
-            # HEAD 2: cell_predict is STRICTLY evaluation-only. Remains frozen.
             if any(key in name for key in ['cell_predict_neck', 'cell_predict_out']):
                 param.requires_grad = False 
-            # HEAD 1 & 3: Deep Upsampling Paths, Layer Attention & Organelle Transformer ALWAYS train
             elif any(key in name for key in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'layer_attention_concat', 'organelle_transformer', 'intermediate_decoder']):
                 param.requires_grad = True  
             elif name in ['alpha', 'beta']:
-                param.requires_grad = getattr(self.net, 'learn_volcano', False) # Check learnable toggle
+                param.requires_grad = getattr(self.net, 'learn_volcano', False)
             else:
-                param.requires_grad = not freeze # ViT Backbone toggles
+                param.requires_grad = not freeze
 
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
@@ -641,7 +541,7 @@ class CellposeModel():
                     z_axis=z_axis,
                     normalize=normalize, 
                     invert=invert,
-                    diameter=diameter[i] if isinstance(diameter, list) or isinstance(diameter, np.ndarray) else diameter, 
+                    diameter=diameter[i] if isinstance(diameter, (list, np.ndarray)) else diameter, 
                     do_3D=do_3D,
                     anisotropy=anisotropy, 
                     augment=augment, 
@@ -669,20 +569,16 @@ class CellposeModel():
         ############# actual eval code ############
         raw_x = np.copy(x)
 
-        # ---> THE DYNAMIC CHANNEL EVALUATION BYPASS <---
-        # 1. Force channels to the LAST axis (H, W, C) for core.run_net
         if x.ndim == 3 and x.shape[0] in [2, 3, 6]: 
             x = x.transpose(1, 2, 0)
         if x.ndim == 4 and x.shape[1] in [2, 3, 6]: 
             x = x.transpose(0, 2, 3, 1)
         
-        # 2. Remove zero-padded 3rd channel if present
         if x.ndim == 3 and x.shape[-1] == 3 and np.max(x[..., 2]) == 0 and np.min(x[..., 2]) == 0: 
             x = x[..., :2]
         if x.ndim == 4 and x.shape[-1] == 3 and np.max(x[..., 2]) == 0 and np.min(x[..., 2]) == 0: 
             x = x[..., :2]
 
-        # 3. Dynamic Padding based on self.nchan (two_tail logic)
         if x.ndim == 3 and x.shape[-1] == 2:
             if self.nchan == 6:
                 x = np.concatenate([np.repeat(x[..., 0:1], 3, axis=-1), np.repeat(x[..., 1:2], 3, axis=-1)], axis=-1)
@@ -698,9 +594,18 @@ class CellposeModel():
             x = x[np.newaxis, ...]
         nimg = x.shape[0]
         
-        image_scaling = 1.0
-        if diameter is not None and diameter > 0:
-            image_scaling = 30. / diameter
+        # ---> DECOUPLED SCALING FACTOR CALCULATIONS <---
+        image_scaling = {'cells': 1.0, 'organelles': 1.0}
+        if diameter is not None:
+            if isinstance(diameter, (list, tuple, np.ndarray)) and len(diameter) >= 2:
+                if diameter[0] > 0: image_scaling['cells'] = 30. / diameter[0]
+                if diameter[1] > 0: image_scaling['organelles'] = 30. / diameter[1]
+            elif isinstance(diameter, dict):
+                if diameter.get('cells', 0) > 0: image_scaling['cells'] = 30. / diameter['cells']
+                if diameter.get('organelles', 0) > 0: image_scaling['organelles'] = 30. / diameter['organelles']
+            elif isinstance(diameter, (int, float)) and diameter > 0:
+                image_scaling['cells'] = 30. / diameter
+                image_scaling['organelles'] = 30. / diameter
 
         normalize_params = normalize_default
         if isinstance(normalize, dict):
@@ -722,7 +627,6 @@ class CellposeModel():
         if do_normalization:
             x = transforms.normalize_img(x, **normalize_params)
 
-        # Force evaluation mode context
         if hasattr(self.net, 'eval'):
             self.net.eval()
 
@@ -758,7 +662,8 @@ class CellposeModel():
                 gc.collect()
 
             if compute_masks:
-                niter_scale = 1 if image_scaling is None else image_scaling
+                current_scale = image_scaling.get(head, 1.0)
+                niter_scale = 1 if current_scale is None else current_scale
                 niter_val = int(200/niter_scale) if niter is None or niter == 0 else niter
                 masks = self._compute_masks(x.shape, dP, cellprob, 
                                             flow_threshold=flow_threshold,
@@ -783,8 +688,6 @@ class CellposeModel():
                 import matplotlib.patches as mpatches
 
                 img_display = raw_x.squeeze()
-                
-                # Safe transposition for 3 or 6 channel arrays
                 if img_display.ndim > 2 and img_display.shape[0] in [2, 3, 4, 6]:
                     img_display = img_display.transpose(1, 2, 0)
                     
@@ -799,13 +702,11 @@ class CellposeModel():
 
                 for row, head in enumerate(heads_to_process):
                     pred_mask = all_masks[row]
-                    
-                    # Extract correct channel based on dynamic nchan
                     chan_idx = 0 if head == 'cells' else (3 if self.nchan == 6 else 1)
                     if img_display.ndim == 3 and img_display.shape[-1] > chan_idx:
                         img_show = img_display[..., chan_idx]
                     else:
-                        img_show = img_display[..., 0] # Fallback
+                        img_show = img_display[..., 0]
                     
                     axes[row][0].imshow(img_show, cmap='gray')
                     title_gt = f"Original Input ({head})"
@@ -874,22 +775,23 @@ class CellposeModel():
         outputs = {}
         heads_to_run = ['cells', 'organelles'] if active_head == 'both' else [active_head]
 
-        # ---> THE MAGIC FIX: Loop over the heads so core.run_net is natively executed TWICE <---
         for head in heads_to_run:
             if hasattr(self.net, 'active_head'):
                 self.net.active_head = head
 
+            current_rescale = rescale.get(head, 1.0) if isinstance(rescale, dict) else rescale
+
             if do_3D:
                 Lz, Ly, Lx = shape[:-1]
-                if rescale != 1.0 or (anisotropy is not None and anisotropy != 1.0):
+                if current_rescale != 1.0 or (anisotropy is not None and anisotropy != 1.0):
                     anisotropy = 1.0 if anisotropy is None else anisotropy
-                    if rescale != 1.0:
-                        x_in = transforms.resize_image(x, Ly=int(Ly*rescale), Lx=int(Lx*rescale))
+                    if current_rescale != 1.0:
+                        x_in = transforms.resize_image(x, Ly=int(Ly*current_rescale), Lx=int(Lx*current_rescale))
                     else:
                         x_in = x
                     x_in = transforms.resize_image(x_in.transpose(1,0,2,3),
-                                                    Ly=int(Lz*anisotropy*rescale), 
-                                                    Lx=int(Lx*rescale)).transpose(1,0,2,3)
+                                                   Ly=int(Lz*anisotropy*current_rescale), 
+                                                   Lx=int(Lx*current_rescale)).transpose(1,0,2,3)
                 else:
                     x_in = x
                 yf, styles = run_3D(self.net, x_in,
@@ -900,17 +802,17 @@ class CellposeModel():
                 yf, styles = run_net(self.net, x, bsize=bsize, augment=augment,
                                     batch_size=batch_size,  
                                     tile_overlap=tile_overlap, 
-                                    rsz=rescale if rescale !=1.0 else None)
+                                    rsz=current_rescale if current_rescale != 1.0 else None)
 
             if resample:
                 if do_3D:
-                    if rescale != 1.0 or Lz != yf.shape[0]:
-                        if rescale != 1.0:
+                    if current_rescale != 1.0 or Lz != yf.shape[0]:
+                        if current_rescale != 1.0:
                             yf = transforms.resize_image(yf, Ly=Ly, Lx=Lx)
                         if Lz != yf.shape[0]:
                             yf = transforms.resize_image(yf.transpose(1, 0, 2, 3), Ly=Lz, Lx=Lx).transpose(1, 0, 2, 3)
                 else:
-                    if rescale != 1.0:
+                    if current_rescale != 1.0:
                         yf = transforms.resize_image(yf, shape[1], shape[2])
             
             if do_3D:
@@ -922,7 +824,6 @@ class CellposeModel():
                 
             outputs[head] = (dP, cellprob, styles.squeeze() if isinstance(styles, np.ndarray) else styles)
 
-        # Re-set back to original state to prevent accidental state corruption
         if hasattr(self.net, 'active_head'):
             self.net.active_head = active_head
 
