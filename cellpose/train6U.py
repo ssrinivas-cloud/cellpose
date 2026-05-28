@@ -170,7 +170,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               model_name=None, class_weights=None, hf_repo_id=None, hf_token=None, 
               save_flows=False, visualize=False, debug=False, auto_unfreeze=False, 
               keep_encoder_frozen=False, turnoff_cell_loss=False, only_cell_loss=False, 
-              two_tail=False, cell_loss_coeff=1, org_loss_coeff=1, **kwargs):
+              two_tail=False, cell_loss_coeff=1, org_loss_coeff=1, test_interval=10, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -191,7 +191,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     LR_cosine = min_lr + 0.5 * (learning_rate - min_lr) * (1 + np.cos(np.pi * np.arange(cosine_epochs) / cosine_epochs)) if cosine_epochs > 0 else np.array([])
     LR = np.concatenate([LR_warmup, LR_cosine])
     
-    train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}, two_tail={two_tail}")
+    train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}, two_tail={two_tail}, test_interval={test_interval}")
     train_logger.info(f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}")
     
     if turnoff_cell_loss and only_cell_loss:
@@ -425,7 +425,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                     
                 is_frozen = False
 
-        if iepoch == 5 or iepoch % 10 == 0:
+        # Use the dynamic interval argument provided, or force a run on the last epoch
+        if iepoch % test_interval == 0 or iepoch == n_epochs - 1:
             lavgt = 0.
             if test_data:
                 rperm_test = np.random.permutation(nimg_test)
@@ -478,7 +479,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         # =====================================================================
         # FULL IMAGE POST-PROCESSING EVALUATION & VISUALIZATION
         # =====================================================================
-        if debug and test_data:
+        if debug and test_data and (iepoch % test_interval == 0 or iepoch == n_epochs - 1):
             temp_model_path = str(filename) + f"_eval_temp"
             net.save_model(temp_model_path)
             eval_nchan = 6 if two_tail else 3
@@ -514,12 +515,12 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
             gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
             
-            n_cells_pred = pred_cells[0].max() if np.any(pred_cells[0]) else 0
-            n_orgs_pred = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
-            n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
-            n_orgs_gt = gt_orgs[0].max() if np.any(gt_orgs[0]) else 0
-            
-            train_logger.info(f"--- [DEBUG] Full Image Counts -> CELLS: Pred {n_cells_pred} (GT {n_cells_gt}) | ORGS: Pred {n_orgs_pred} (GT {n_orgs_gt}) ---")
+            # Log the counts for the first image purely as a sys check
+            n_cells_pred_0 = pred_cells[0].max() if np.any(pred_cells[0]) else 0
+            n_orgs_pred_0 = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
+            n_cells_gt_0 = gt_cells[0].max() if np.any(gt_cells[0]) else 0
+            n_orgs_gt_0 = gt_orgs[0].max() if np.any(gt_orgs[0]) else 0
+            train_logger.info(f"--- [DEBUG] Image 0 Counts -> CELLS: Pred {n_cells_pred_0} (GT {n_cells_gt_0}) | ORGS: Pred {n_orgs_pred_0} (GT {n_orgs_gt_0}) ---")
             
             def calc_metrics(gt_masks, pred_masks):
                 tp = fp = fn = 0
@@ -534,47 +535,59 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
             if visualize:
                 try:
-                    fig, axes = plt.subplots(2, 2, figsize=(16, 16))
-                    fig.suptitle(f"Epoch {iepoch} - Post-Processed Mask Reconstructions", fontsize=18, y=0.98)
-                    
-                    img_disp = test_data[0].copy()
-                    if img_disp.ndim == 3 and img_disp.shape[0] in [1, 2, 3, 6]:
-                        img_disp = img_disp.transpose(1, 2, 0)
-                    elif img_disp.ndim == 2:
-                        img_disp = img_disp[..., np.newaxis]
-                    
-                    if img_disp.max() > img_disp.min(): 
-                        img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
-                    
-                    # Fix for single-channel evaluation visualization
-                    img_cell = img_disp[..., 0] 
-                    img_org = img_disp[..., 3] if (two_tail and img_disp.shape[-1] >= 4) else (img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0])
-                    
-                    axes[0, 0].imshow(img_cell, cmap='gray')
-                    if np.any(gt_cells[0]): axes[0, 0].contour(gt_cells[0] > 0, colors='lime', linewidths=1.2)
-                    axes[0, 0].set_title(f"Cells - Actual GT ({n_cells_gt} masks)", fontsize=12)
-                    axes[0, 0].axis('off')
-                    
-                    axes[0, 1].imshow(img_cell, cmap='gray')
-                    if np.any(pred_cells[0]): axes[0, 1].contour(pred_cells[0] > 0, colors='red', linewidths=1.2)
-                    axes[0, 1].set_title(f"Cells - Predicted Reconstructed ({n_cells_pred} masks)", fontsize=12)
-                    axes[0, 1].axis('off')
-                    
-                    axes[1, 0].imshow(img_org, cmap='gray')
-                    if np.any(gt_orgs[0]): axes[1, 0].contour(gt_orgs[0] > 0, colors='lime', linewidths=1.2)
-                    axes[1, 0].set_title(f"Organelles - Actual GT ({n_orgs_gt} masks)", fontsize=12)
-                    axes[1, 0].axis('off')
-                    
-                    axes[1, 1].imshow(img_org, cmap='gray')
-                    if np.any(pred_orgs[0]): axes[1, 1].contour(pred_orgs[0] > 0, colors='red', linewidths=1.2)
-                    axes[1, 1].set_title(f"Organelles - Predicted Reconstructed ({n_orgs_pred} masks)", fontsize=12)
-                    axes[1, 1].axis('off')
-                    
-                    plt.tight_layout()
-                    vis_save_path = save_path / f"epoch_{iepoch:04d}_post_processed_overlay.png"
-                    plt.savefig(vis_save_path, bbox_inches='tight', dpi=150)
-                    plt.close(fig)
-                    train_logger.info(f"[DEBUG] Post-processing visualization overlay written to: {vis_save_path}")
+                    num_to_plot = min(3, len(test_data))
+                    for img_idx in range(num_to_plot):
+                        fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+                        fig.suptitle(f"Epoch {iepoch} - Post-Processed Mask Reconstructions (Image {img_idx})", fontsize=18, y=0.98)
+                        
+                        img_disp = test_data[img_idx].copy()
+                        if img_disp.ndim == 3 and img_disp.shape[0] in [1, 2, 3, 6]:
+                            img_disp = img_disp.transpose(1, 2, 0)
+                        elif img_disp.ndim == 2:
+                            img_disp = img_disp[..., np.newaxis]
+                        
+                        if img_disp.max() > img_disp.min(): 
+                            img_disp = (img_disp - img_disp.min()) / (img_disp.max() - img_disp.min())
+                        
+                        # Fix for single-channel evaluation visualization
+                        img_cell = img_disp[..., 0] 
+                        img_org = img_disp[..., 3] if (two_tail and img_disp.shape[-1] >= 4) else (img_disp[..., 1] if img_disp.shape[-1] >= 2 else img_disp[..., 0])
+                        
+                        curr_gt_c = gt_cells[img_idx]
+                        curr_pred_c = pred_cells[img_idx]
+                        curr_gt_o = gt_orgs[img_idx]
+                        curr_pred_o = pred_orgs[img_idx]
+
+                        n_curr_cells_gt = curr_gt_c.max() if np.any(curr_gt_c) else 0
+                        n_curr_cells_pred = curr_pred_c.max() if np.any(curr_pred_c) else 0
+                        n_curr_orgs_gt = curr_gt_o.max() if np.any(curr_gt_o) else 0
+                        n_curr_orgs_pred = curr_pred_o.max() if np.any(curr_pred_o) else 0
+
+                        axes[0, 0].imshow(img_cell, cmap='gray')
+                        if np.any(curr_gt_c): axes[0, 0].contour(curr_gt_c > 0, colors='lime', linewidths=1.2)
+                        axes[0, 0].set_title(f"Cells - Actual GT ({n_curr_cells_gt} masks)", fontsize=12)
+                        axes[0, 0].axis('off')
+                        
+                        axes[0, 1].imshow(img_cell, cmap='gray')
+                        if np.any(curr_pred_c): axes[0, 1].contour(curr_pred_c > 0, colors='red', linewidths=1.2)
+                        axes[0, 1].set_title(f"Cells - Predicted Reconstructed ({n_curr_cells_pred} masks)", fontsize=12)
+                        axes[0, 1].axis('off')
+                        
+                        axes[1, 0].imshow(img_org, cmap='gray')
+                        if np.any(curr_gt_o): axes[1, 0].contour(curr_gt_o > 0, colors='lime', linewidths=1.2)
+                        axes[1, 0].set_title(f"Organelles - Actual GT ({n_curr_orgs_gt} masks)", fontsize=12)
+                        axes[1, 0].axis('off')
+                        
+                        axes[1, 1].imshow(img_org, cmap='gray')
+                        if np.any(curr_pred_o): axes[1, 1].contour(curr_pred_o > 0, colors='red', linewidths=1.2)
+                        axes[1, 1].set_title(f"Organelles - Predicted Reconstructed ({n_curr_orgs_pred} masks)", fontsize=12)
+                        axes[1, 1].axis('off')
+                        
+                        plt.tight_layout()
+                        vis_save_path = save_path / f"epoch_{iepoch:04d}_img_{img_idx}_post_processed_overlay.png"
+                        plt.savefig(vis_save_path, bbox_inches='tight', dpi=150)
+                        plt.close(fig)
+                    train_logger.info(f"[DEBUG] Post-processing visualization overlays written to: {save_path}")
                 except Exception as e:
                     train_logger.warning(f"Post-processed overlay execution block errored: {e}")
             
