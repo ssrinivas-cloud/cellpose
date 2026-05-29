@@ -8,7 +8,7 @@ import os
 import numpy as np
 import scipy.ndimage
 import matplotlib.pyplot as plt  
-from cellpose import io, utils, dynamics, model5 
+from cellpose import io, utils, dynamics, model6  
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
@@ -253,17 +253,19 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     # =================================================================
     if unfreeze_schedule is not None and len(unfreeze_schedule) == 2:
         cycle_interval, unfreeze_duration = unfreeze_schedule
-        train_logger.info(f"\n>>> [MODELS] CYCLIC FREEZE SCHEDULE ACTIVE: Backbone will freeze for {cycle_interval - unfreeze_duration} epochs, then unfreeze for {unfreeze_duration} epochs.")
+        train_logger.info(f"\n>>> [MODELS] CYCLIC FREEZE SCHEDULE ACTIVE: Backbone & cell_predict will freeze for {cycle_interval - unfreeze_duration} epochs, then unfreeze for {unfreeze_duration} epochs.")
         start_frozen = True
     else:
         train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End from start.")
         start_frozen = False
 
+    is_backbone_frozen = start_frozen
+
     for name, param in net.named_parameters():
         if any(x in name for x in ['cell_decoder', 'org_decoder']):
             param.requires_grad = True # Decoders ALWAYS train
-        elif 'backbone' in name:
-            param.requires_grad = not start_frozen # Start in the correct state
+        elif any(x in name for x in ['backbone', 'cell_predict']):
+            param.requires_grad = not is_backbone_frozen # Start in the correct state
         else:
             param.requires_grad = True
 
@@ -301,16 +303,18 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 
                 # Trigger Unfreeze (e.g. at epoch 20, 40, 60...)
                 if mod_epoch == 0:
-                    train_logger.info(f"\n>>> [AUTO-UNFREEZE] Epoch {iepoch}: UNFREEZING backbone for the next {unfreeze_duration} epochs.")
+                    train_logger.info(f"\n>>> [AUTO-UNFREEZE] Epoch {iepoch}: UNFREEZING backbone & cell_predict for the next {unfreeze_duration} epochs.")
+                    is_backbone_frozen = False
                     for name, param in net.named_parameters():
-                        if 'backbone' in name:
+                        if any(x in name for x in ['backbone', 'cell_predict']):
                             param.requires_grad = True
                             
                 # Trigger Freeze (e.g. at epoch 25, 45, 65...)
                 elif mod_epoch == unfreeze_duration:
-                    train_logger.info(f"\n>>> [AUTO-FREEZE] Epoch {iepoch}: FREEZING backbone.")
+                    train_logger.info(f"\n>>> [AUTO-FREEZE] Epoch {iepoch}: FREEZING backbone & cell_predict.")
+                    is_backbone_frozen = True
                     for name, param in net.named_parameters():
-                        if 'backbone' in name:
+                        if any(x in name for x in ['backbone', 'cell_predict']):
                             param.requires_grad = False
                             param.grad = None # Safely clear lingering gradients
         
@@ -327,10 +331,10 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             imgs, lbls_c, lbls_o = _get_batch(inds, data=train_data, labels_c=train_flows_c, labels_o=train_flows_o, two_tail=two_tail)
             diams = np.array([diam_train[i] for i in inds])
             
-            # Safe handling if diam_mean is deprecated in new model structure
+            # ---> SCALING FIX: network_target / actual_size <---
             net_diam = getattr(net, 'diam_mean', None)
             net_diam_val = net_diam.item() if net_diam is not None else 30.0
-            rsc = diams / net_diam_val if rescale else np.ones(len(diams), "float32")
+            rsc = net_diam_val / diams if rescale else np.ones(len(diams), "float32")
             
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
             imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
@@ -404,7 +408,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         fig.colorbar(im_prob_c, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
                         axes[0, 2].imshow(c_flow_rgb)
-                        axes[0, 2].set_title("Cells: Flow Vectors")
+                        axes[0, 2].set_title("Cells: Flow Vectors (cell_predict)")
                         axes[0, 2].axis('off')
 
                         axes[1, 0].imshow(img_o, cmap='gray')
@@ -433,8 +437,11 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 # 1. CELL HEAD LOSS: Both Prob & Flow
                 loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
                 
-                # 2. CELL PREDICT HEAD LOSS: Both Prob & Flow
-                loss_cell_pred, l_prob_cp, l_flow_cp, l_tv_cp = _loss_fn_seg(L_c, y_cell_pred, device)
+                # 2. CELL PREDICT HEAD LOSS: Compute ONLY if unfrozen to save compute/interference
+                if not is_backbone_frozen:
+                    loss_cell_pred, l_prob_cp, l_flow_cp, l_tv_cp = _loss_fn_seg(L_c, y_cell_pred, device)
+                else:
+                    loss_cell_pred = torch.tensor(0.0, device=device)
                 
                 # 3. ORGANELLE HEAD LOSS: Both Prob & Flow
                 loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
@@ -484,9 +491,10 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         imgs, lbls_c, lbls_o = _get_batch(inds, data=test_data, labels_c=test_flows_c, labels_o=test_flows_o, two_tail=two_tail)
                         diams = np.array([diam_test[i] for i in inds])
                         
+                        # ---> SCALING FIX: network_target / actual_size <---
                         net_diam = getattr(net, 'diam_mean', None)
                         net_diam_val = net_diam.item() if net_diam is not None else 30.0
-                        rsc = diams / net_diam_val if rescale else np.ones(len(diams), "float32")
+                        rsc = net_diam_val / diams if rescale else np.ones(len(diams), "float32")
                         
                         lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
                         imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
@@ -506,7 +514,12 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                                 y_cell_pred = y_cell
                                 
                             loss_cell, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
-                            loss_cell_pred, _, _, _ = _loss_fn_seg(L_c, y_cell_pred, device)
+                            
+                            if not is_backbone_frozen:
+                                loss_cell_pred, _, _, _ = _loss_fn_seg(L_c, y_cell_pred, device)
+                            else:
+                                loss_cell_pred = torch.tensor(0.0, device=device)
+                                
                             loss_org, _, _, _ = _loss_fn_org(L_o, y_org, device) 
                             
                             if only_cell_loss:
@@ -536,7 +549,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 net.save_model(temp_model_path)
                 
                 # Updated to use model6.CellposeModel wrapper
-                eval_model = model5.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
+                eval_model = model6.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
                 
                 masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
                 pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
