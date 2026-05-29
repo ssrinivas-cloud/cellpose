@@ -8,7 +8,7 @@ import os
 import numpy as np
 import scipy.ndimage
 import matplotlib.pyplot as plt  
-from cellpose import io, utils, dynamics, model5  # <--- Updated to model6
+from cellpose import io, utils, dynamics, model6  
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
@@ -262,8 +262,6 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     for name, param in net.named_parameters():
         if any(x in name for x in ['cell_decoder', 'org_decoder']):
             param.requires_grad = True # Decoders ALWAYS train
-        elif name in ['alpha', 'beta']:
-            param.requires_grad = getattr(net, 'learn_volcano', False)
         elif 'backbone' in name:
             param.requires_grad = not start_frozen # Start in the correct state
         else:
@@ -337,7 +335,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
             imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
             lbl_c_aug, lbl_o_aug = lbl_aug[:, :3, :, :], lbl_aug[:, 3:, :, :]
-                                                                                                                        
+                                                                                                                                    
             X = torch.from_numpy(imgi).to(device)
             L_c = torch.from_numpy(lbl_c_aug).to(device)
             L_o = torch.from_numpy(lbl_o_aug).to(device)
@@ -387,7 +385,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         cell_prob_map = torch.sigmoid(y_cell[0, -1]).detach().cpu().numpy()
                         org_prob_map = torch.sigmoid(y_org[0, -1]).detach().cpu().numpy()
                         
-                        # Use y_cell_pred for plotting cell flows, since y_cell doesn't have structural flows anymore
+                        # Plotting cell flows (using y_cell_pred, though y_cell now has flows too)
                         c_flow_vis = np.clip((y_cell_pred[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
                         o_flow_vis = np.clip((y_org[0, -3:-1].detach().cpu().numpy().transpose(1, 2, 0) + 5) / 10, 0, 1)
                         
@@ -406,7 +404,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         fig.colorbar(im_prob_c, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
                         axes[0, 2].imshow(c_flow_rgb)
-                        axes[0, 2].set_title("Cells: Flow Vectors (cell_predict)")
+                        axes[0, 2].set_title("Cells: Flow Vectors")
                         axes[0, 2].axis('off')
 
                         axes[1, 0].imshow(img_o, cmap='gray')
@@ -432,10 +430,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 # ==========================================================
                 # LOSS CALCULATIONS
                 # ==========================================================
-                # 1. CELL HEAD LOSS: Probability Map Only
-                target_mask_c = (L_c[:, -3] > 0.5).to(y_cell.dtype)
-                pred_logits_c = y_cell[:, -1]
-                loss_cell_prob = focal_loss_with_logits(pred_logits_c, target_mask_c, alpha=0.25, gamma=2.0) + dice_loss(pred_logits_c, target_mask_c)
+                # 1. CELL HEAD LOSS: Both Prob & Flow
+                loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
                 
                 # 2. CELL PREDICT HEAD LOSS: Both Prob & Flow
                 loss_cell_pred, l_prob_cp, l_flow_cp, l_tv_cp = _loss_fn_seg(L_c, y_cell_pred, device)
@@ -444,18 +440,18 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
 
                 if only_cell_loss:
-                    loss = (loss_cell_prob + loss_cell_pred) / accumulation_steps
+                    loss = (loss_cell + loss_cell_pred) / accumulation_steps
                     if debug and k == 0:
-                        train_logger.info(f"[DEBUG-LOSS] CELL ONLY -> Prob Map Loss: {loss_cell_prob.item():.4f} | Cell Predict Total: {loss_cell_pred.item():.4f}")
+                        train_logger.info(f"[DEBUG-LOSS] CELL ONLY -> Cell Head Total: {loss_cell.item():.4f} | Cell Predict Total: {loss_cell_pred.item():.4f}")
                 elif turnoff_cell_loss:
                     loss = loss_org / accumulation_steps
                     if debug and k == 0:
                         train_logger.info(f"[DEBUG-LOSS] ORG ONLY -> Total: {loss_org.item():.4f} | Prob: {l_prob_o.item():.4f} | Flow: {l_flow_o.item():.4f}")
                 else:
-                    total_cell_branch = loss_cell_prob + loss_cell_pred
+                    total_cell_branch = loss_cell + loss_cell_pred
                     loss = (eff_cell_coeff * total_cell_branch + eff_org_coeff * loss_org) / accumulation_steps
                     if debug and k == 0:
-                        train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell [Prob Only:{loss_cell_prob.item():.4f}, Predict Head Total:{loss_cell_pred.item():.4f}] | Org [Total:{loss_org.item():.4f}]")
+                        train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell [Head Total:{loss_cell.item():.4f}, Predict Total:{loss_cell_pred.item():.4f}] | Org [Total:{loss_org.item():.4f}]")
 
 
             scaler.scale(loss).backward()
@@ -509,19 +505,16 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                                 y_cell, y_org = outputs
                                 y_cell_pred = y_cell
                                 
-                            target_mask_c = (L_c[:, -3] > 0.5).to(y_cell.dtype)
-                            pred_logits_c = y_cell[:, -1]
-                            loss_cell_prob = focal_loss_with_logits(pred_logits_c, target_mask_c, alpha=0.25, gamma=2.0) + dice_loss(pred_logits_c, target_mask_c)
-                            
+                            loss_cell, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
                             loss_cell_pred, _, _, _ = _loss_fn_seg(L_c, y_cell_pred, device)
                             loss_org, _, _, _ = _loss_fn_org(L_o, y_org, device) 
                             
                             if only_cell_loss:
-                                loss = loss_cell_prob + loss_cell_pred
+                                loss = loss_cell + loss_cell_pred
                             elif turnoff_cell_loss:
                                 loss = loss_org
                             else:
-                                total_cell_branch = loss_cell_prob + loss_cell_pred
+                                total_cell_branch = loss_cell + loss_cell_pred
                                 loss = eff_cell_coeff * total_cell_branch + eff_org_coeff * loss_org
                         
                         lavgt += loss.item() * len(imgi)
@@ -543,7 +536,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 net.save_model(temp_model_path)
                 
                 # Updated to use model6.CellposeModel wrapper
-                eval_model = model5.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
+                eval_model = model6.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
                 
                 masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
                 pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
