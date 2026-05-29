@@ -180,9 +180,13 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               two_tail=False, cell_loss_coeff=1.0, org_loss_coeff=1.0, **kwargs):
     
     device = net.device
+    
+    # Safely handle the property setter restriction by modifying the underlying attribute and using .to()
     original_net_dtype = net.dtype 
-    if net.dtype == torch.bfloat16:
-        net.dtype = torch.float32
+    if original_net_dtype == torch.bfloat16:
+        net = net.to(torch.float32)
+        if hasattr(net, '_true_dtype'):
+            net._true_dtype = torch.float32
 
     out = _process_train_test_paired(train_data, train_labels_c, train_labels_o, test_data, test_labels_c, test_labels_o, device=device)
     train_flows_c, train_flows_o, test_flows_c, test_flows_o, diam_train, diam_test = out
@@ -297,7 +301,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
             imgi, lbl_aug = random_rotate_and_resize(imgs, Y=lbls_stacked, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize))[:2]
             lbl_c_aug, lbl_o_aug = lbl_aug[:, :3, :, :], lbl_aug[:, 3:, :, :]
-                                                                                                                                            
+                                                                                                                                                                    
             X = torch.from_numpy(imgi).to(device)
             L_c = torch.from_numpy(lbl_c_aug).to(device)
             L_o = torch.from_numpy(lbl_o_aug).to(device)
@@ -563,7 +567,11 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
     net.save_model(str(filename))
 
-    if original_net_dtype != torch.float32: net.dtype = original_net_dtype
+    # Safely revert the dtype
+    if original_net_dtype != torch.float32: 
+        net = net.to(original_net_dtype)
+        if hasattr(net, '_true_dtype'):
+            net._true_dtype = original_net_dtype
 
     # --- HUGGING FACE BEST MODEL PUSH ---
     if hf_repo_id and hf_token:
