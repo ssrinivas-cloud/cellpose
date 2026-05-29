@@ -1,8 +1,3 @@
-Here is the complete, fully integrated `model6.py`.
-
-This version includes all the structural upgrades we've discussed: the **GroupNorm Residual Blocks** to stabilize small-batch training, the **Linear Projection layers** to retain 100% of your deep contextual features, the **Patch-8 Swin adjustments**, and the **explicit threshold logic** for the dual heads.
-
-```python
 """
 Copyright © 2026 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
 Refactored to Dual-Parasite Swin-FPN Architecture for Multi-Scale Extraction.
@@ -76,7 +71,7 @@ class ResidualBlock(nn.Module):
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
         self.norm2 = nn.GroupNorm(groups, out_channels)
         
-        # Shortcut connection to handle channel dimension changes (e.g., from Concat)
+        # Shortcut connection to handle channel dimension changes
         if in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
@@ -95,7 +90,6 @@ class ResidualBlock(nn.Module):
         out = self.conv2(out)
         out = self.norm2(out)
         
-        # The magical residual addition
         out += identity
         return F.relu(out, inplace=True)
 
@@ -103,18 +97,18 @@ class ResidualBlock(nn.Module):
 class ParasiteDecoder(nn.Module):
     """
     Lightweight Feature Pyramid Network (FPN) upsampler.
-    Uses 1x1 lateral convolutions to project all incoming Swin stages 
-    into a unified hidden dimension, eliminating channel mismatch issues.
+    Optionally accepts High-Res CNN Stem features for late-stage fusion.
     """
-    def __init__(self, in_channels_list, hidden_dim=256, final_upsample_factor=8, out_channels=3):
+    def __init__(self, in_channels_list, hidden_dim=256, final_upsample_factor=8, out_channels=3, use_stem=False, stem_dim=64):
         super().__init__()
+        self.use_stem = use_stem
         
         # 1x1 Lateral Convolutions to unify the channel dimensions
         self.lat_high = nn.Conv2d(in_channels_list[0], hidden_dim, kernel_size=1)
         self.lat_mid  = nn.Conv2d(in_channels_list[1], hidden_dim, kernel_size=1)
         self.lat_low  = nn.Conv2d(in_channels_list[2], hidden_dim, kernel_size=1)
 
-        # Upsampling and fusion layers using Residual Blocks with GroupNorm
+        # Upsampling and fusion layers using Residual Blocks
         self.up_high = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.conv_high_mid = ResidualBlock(hidden_dim * 2, hidden_dim)
 
@@ -124,33 +118,39 @@ class ParasiteDecoder(nn.Module):
         # Upsample back to native image resolution (H, W)
         self.final_up = nn.Upsample(scale_factor=final_upsample_factor, mode='bilinear', align_corners=False)
         
+        # Late-stage Stem Fusion Block
+        if self.use_stem:
+            self.stem_fusion = ResidualBlock(hidden_dim + stem_dim, hidden_dim)
+            
         # Output: [Flow_Y, Flow_X, Cellprob]
         self.final_conv = nn.Conv2d(hidden_dim, out_channels, kernel_size=1)
 
-    def forward(self, x_high, x_mid, x_low):
-        # Unify channels first via 1x1 projections
+    def forward(self, x_high, x_mid, x_low, stem_feats=None):
         h_high = self.lat_high(x_high)
         h_mid  = self.lat_mid(x_mid)
         h_low  = self.lat_low(x_low)
 
-        # 1. Top-Down Fusion (High to Mid)
         x = self.up_high(h_high)
         x = torch.cat([x, h_mid], dim=1)
         x = self.conv_high_mid(x)
 
-        # 2. Top-Down Fusion (Mid to Low)
         x = self.up_mid(x)
         x = torch.cat([x, h_low], dim=1)
         x = self.conv_mid_low(x)
 
-        # 3. Final Native Projection
         x = self.final_up(x)
+        
+        # Inject the High-Res CNN Stem details before the final projection
+        if self.use_stem and stem_feats is not None:
+            x = torch.cat([x, stem_feats], dim=1)
+            x = self.stem_fusion(x)
+            
         return self.final_conv(x)
 
 
 class DualParasiteSwinNetwork(nn.Module):
     """
-    Houses the frozen Swin feature quarry and routes the stages 
+    Houses the Swin feature quarry, High-Res CNN stem, and routes stages 
     to the independent Organelle and Cell parasite decoders.
     """
     def __init__(self, nchan=3, hidden_dim=256):
@@ -158,27 +158,46 @@ class DualParasiteSwinNetwork(nn.Module):
         self._true_dtype = torch.float32
         self.active_head = 'both'
         
-        # 1. The Swin Backbone (Universal Feature Quarry)
-        models_logger.info(f">>> Instantiating Swin-Base Backbone ({nchan} channels, Dynamic Interp 256x256, Patch Size 8)...")
+        # 1. High-Resolution CNN Stem (Bypasses Transformer completely)
+        self.stem_dim = 64
+        self.high_res_stem = nn.Sequential(
+            nn.Conv2d(nchan, self.stem_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(16, self.stem_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.stem_dim, self.stem_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(16, self.stem_dim),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 2. The Swin Backbone (RESTORED to pre-trained Patch 4)
+        models_logger.info(f">>> Instantiating Pre-Trained Swin-Base Backbone ({nchan} channels, Patch Size 4)...")
         self.backbone = timm.create_model(
             'swin_base_patch4_window7_224', 
             in_chans=nchan, 
             features_only=True, 
-            pretrained=False,          # Set to False because pretrained weights clash with custom patch_size
+            pretrained=True,          
             img_size=256,              
-            dynamic_img_size=True,
-            patch_size=8               # Custom patch size applied here
+            dynamic_img_size=True
         )
         
         # Linear style projection layers
         self.style_proj_c = nn.Linear(1024, 256)
         self.style_proj_o = nn.Linear(512, 256)
         
-        # 2. The Cell Parasite
-        self.cell_decoder = ParasiteDecoder(in_channels_list=[1024, 512, 256], hidden_dim=hidden_dim, final_upsample_factor=16)
+        # 3. The Cell Parasite
+        # Hooks into S4, S3, S2. S2 is 1/8 resolution. Final upsample = 8x.
+        self.cell_decoder = ParasiteDecoder(
+            in_channels_list=[1024, 512, 256], hidden_dim=hidden_dim, 
+            final_upsample_factor=8, use_stem=False
+        )
         
-        # 3. The Organelle Parasite
-        self.org_decoder = ParasiteDecoder(in_channels_list=[512, 256, 128], hidden_dim=hidden_dim, final_upsample_factor=8)
+        # 4. The Organelle Parasite
+        # Hooks into S3, S2, S1. S1 is 1/4 resolution. Final upsample = 4x.
+        # ACTIVATES stem injection to recover sub-patch resolutions.
+        self.org_decoder = ParasiteDecoder(
+            in_channels_list=[512, 256, 128], hidden_dim=hidden_dim, 
+            final_upsample_factor=4, use_stem=True, stem_dim=self.stem_dim
+        )
 
     @property
     def device(self):
@@ -210,6 +229,9 @@ class DualParasiteSwinNetwork(nn.Module):
         else:
             x_target = x
             
+        # Extract native 1x resolution features directly from raw image
+        stem_feats = self.high_res_stem(x_target)
+            
         # --- PASS 2: MAIN FEATURE EXTRACTION ---
         with torch.no_grad():
             features = self.backbone(x_target)
@@ -224,7 +246,6 @@ class DualParasiteSwinNetwork(nn.Module):
 
         out_c, out_o = None, None
         
-        # Style Projections replacing the rigid slicing
         pool_s4 = torch.mean(s4, dim=(2, 3)) 
         pool_s3 = torch.mean(s3, dim=(2, 3))
         
@@ -236,7 +257,8 @@ class DualParasiteSwinNetwork(nn.Module):
             out_c = self.cell_decoder(s4, s3, s2)
 
         if self.active_head in ['organelles', 'both']:
-            out_o = self.org_decoder(s3, s2, s1)
+            # Pass the stem_feats directly into the organelle decoder
+            out_o = self.org_decoder(s3, s2, s1, stem_feats=stem_feats)
 
         if self.active_head == 'cells':
             return out_c, style_c
@@ -293,7 +315,7 @@ class CellposeModel():
     def set_freeze_backbone(self, freeze=True):
         self.freeze_backbone = freeze
         if freeze:
-            models_logger.info("\n>>> [MODELS] BACKBONE FROZEN: Universal Feature Quarry active. Only FPN Parasites will train.")
+            models_logger.info("\n>>> [MODELS] BACKBONE FROZEN: Universal Feature Quarry active. FPN Parasites and CNN Stem will train.")
         else:
             models_logger.info("\n>>> [MODELS] UNFREEZING BACKBONE: Warning - Swin Backbone is training End-to-End.")
             
@@ -307,6 +329,10 @@ class CellposeModel():
         for param in self.net.style_proj_c.parameters():
             param.requires_grad = True
         for param in self.net.style_proj_o.parameters():
+            param.requires_grad = True
+            
+        # ENSURE high-res stem always trains
+        for param in self.net.high_res_stem.parameters():
             param.requires_grad = True
 
         
@@ -440,7 +466,6 @@ class CellposeModel():
 
         heads_to_process = ['cells', 'organelles'] if active_head == 'both' else [active_head]
 
-        # Explicitly enforcing decoupled thresholds
         thresholds = {
             'cells': {'flow': 0.2, 'prob': 0.1},
             'organelles': {'flow': 0.2, 'prob': 0.1} 
@@ -464,7 +489,6 @@ class CellposeModel():
                 niter_scale = 1 if current_scale is None else current_scale
                 niter_val = int(200/niter_scale) if niter is None or niter == 0 else niter
                 
-                # Assign decoupled thresholds
                 current_flow = thresholds[head]['flow']
                 current_prob = thresholds[head]['prob']
 
@@ -677,5 +701,3 @@ class CellposeModel():
         if changed_device_from is not None:
             self.device = torch.device(changed_device_from)
         return masks
-
-```
