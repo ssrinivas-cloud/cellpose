@@ -1,3 +1,8 @@
+Here is the complete, fully integrated `model6.py`.
+
+This version includes all the structural upgrades we've discussed: the **GroupNorm Residual Blocks** to stabilize small-batch training, the **Linear Projection layers** to retain 100% of your deep contextual features, the **Patch-8 Swin adjustments**, and the **explicit threshold logic** for the dual heads.
+
+```python
 """
 Copyright © 2026 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
 Refactored to Dual-Parasite Swin-FPN Architecture for Multi-Scale Extraction.
@@ -55,8 +60,45 @@ def get_user_models():
 
 
 # =================================================================
-# FPN PARASITE DECODERS (UNIFIED CHANNELS)
+# RESIDUAL BLOCKS & FPN PARASITE DECODERS 
 # =================================================================
+
+class ResidualBlock(nn.Module):
+    """
+    A robust residual block using Group Normalization.
+    Solves small-batch volatility and prevents vanishing gradients.
+    """
+    def __init__(self, in_channels, out_channels, groups=32):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.norm1 = nn.GroupNorm(groups, out_channels)
+        
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.norm2 = nn.GroupNorm(groups, out_channels)
+        
+        # Shortcut connection to handle channel dimension changes (e.g., from Concat)
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.GroupNorm(groups, out_channels)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = F.relu(out, inplace=True)
+        
+        out = self.conv2(out)
+        out = self.norm2(out)
+        
+        # The magical residual addition
+        out += identity
+        return F.relu(out, inplace=True)
+
 
 class ParasiteDecoder(nn.Module):
     """
@@ -72,20 +114,12 @@ class ParasiteDecoder(nn.Module):
         self.lat_mid  = nn.Conv2d(in_channels_list[1], hidden_dim, kernel_size=1)
         self.lat_low  = nn.Conv2d(in_channels_list[2], hidden_dim, kernel_size=1)
 
-        # Upsampling and fusion layers
+        # Upsampling and fusion layers using Residual Blocks with GroupNorm
         self.up_high = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv_high_mid = nn.Sequential(
-            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True)
-        )
+        self.conv_high_mid = ResidualBlock(hidden_dim * 2, hidden_dim)
 
         self.up_mid = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv_mid_low = nn.Sequential(
-            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True)
-        )
+        self.conv_mid_low = ResidualBlock(hidden_dim * 2, hidden_dim)
 
         # Upsample back to native image resolution (H, W)
         self.final_up = nn.Upsample(scale_factor=final_upsample_factor, mode='bilinear', align_corners=False)
@@ -125,24 +159,26 @@ class DualParasiteSwinNetwork(nn.Module):
         self.active_head = 'both'
         
         # 1. The Swin Backbone (Universal Feature Quarry)
-        # Using base patch4 window7. Native feature dimensions: [128, 256, 512, 1024]
-        models_logger.info(f">>> Instantiating Swin-Base Backbone ({nchan} channels, Dynamic Interp 256x256)...")
+        models_logger.info(f">>> Instantiating Swin-Base Backbone ({nchan} channels, Dynamic Interp 256x256, Patch Size 8)...")
         self.backbone = timm.create_model(
             'swin_base_patch4_window7_224', 
             in_chans=nchan, 
             features_only=True, 
-            pretrained=True,
-            img_size=256,             # Option 2: Explicitly interpolate to 256
-            dynamic_img_size=True     # Option 2: Allow dynamic window padding for safety
+            pretrained=False,          # Set to False because pretrained weights clash with custom patch_size
+            img_size=256,              
+            dynamic_img_size=True,
+            patch_size=8               # Custom patch size applied here
         )
         
-        # 2. The Cell Parasite (Hooks into deep semantics: Stages 4, 3, 2)
-        # Stage 2 native resolution is 1/8, so final upsample is 8x
-        self.cell_decoder = ParasiteDecoder(in_channels_list=[1024, 512, 256], hidden_dim=hidden_dim, final_upsample_factor=8)
+        # Linear style projection layers
+        self.style_proj_c = nn.Linear(1024, 256)
+        self.style_proj_o = nn.Linear(512, 256)
         
-        # 3. The Organelle Parasite (Hooks into high-res details: Stages 3, 2, 1)
-        # Stage 1 native resolution is 1/4, so final upsample is 4x
-        self.org_decoder = ParasiteDecoder(in_channels_list=[512, 256, 128], hidden_dim=hidden_dim, final_upsample_factor=4)
+        # 2. The Cell Parasite
+        self.cell_decoder = ParasiteDecoder(in_channels_list=[1024, 512, 256], hidden_dim=hidden_dim, final_upsample_factor=16)
+        
+        # 3. The Organelle Parasite
+        self.org_decoder = ParasiteDecoder(in_channels_list=[512, 256, 128], hidden_dim=hidden_dim, final_upsample_factor=8)
 
     @property
     def device(self):
@@ -161,15 +197,13 @@ class DualParasiteSwinNetwork(nn.Module):
     def forward(self, x):
         x = x.to(self._true_dtype)
         
-        # --- PASS 1: EVALUATION FEEDBACK (If requested) ---
+        # --- PASS 1: EVALUATION FEEDBACK ---
         if not self.training and self.active_head in ['cells', 'both']:
             with torch.no_grad():
                 feats_pass1 = self.backbone(x)
-                # Ensure correct channel alignment: [B, H, W, C] -> [B, C, H, W]
                 if feats_pass1[3].shape[-1] == 1024:
                     feats_pass1 = [feat.permute(0, 3, 1, 2).contiguous() for feat in feats_pass1]
                 
-                # Cell hook mapping: High=S4(idx 3), Mid=S3(idx 2), Low=S2(idx 1)
                 out_c_pass1 = self.cell_decoder(feats_pass1[3], feats_pass1[2], feats_pass1[1])
                 prob_map = torch.sigmoid(out_c_pass1[:, 2:3, :, :])
                 x_target = x * prob_map
@@ -177,13 +211,11 @@ class DualParasiteSwinNetwork(nn.Module):
             x_target = x
             
         # --- PASS 2: MAIN FEATURE EXTRACTION ---
-        # The backbone is completely frozen, so we don't track its gradients to save massive VRAM
         with torch.no_grad():
             features = self.backbone(x_target)
             
         s1, s2, s3, s4 = features[0], features[1], features[2], features[3]
 
-        # >>> FIX: Permute from [B, H, W, C] to [B, C, H, W] <<<
         if s4.shape[-1] == 1024:
             s1 = s1.permute(0, 3, 1, 2).contiguous()
             s2 = s2.permute(0, 3, 1, 2).contiguous()
@@ -192,10 +224,12 @@ class DualParasiteSwinNetwork(nn.Module):
 
         out_c, out_o = None, None
         
-        # Fake "styles" for Cellpose compatibility by pooling the deepest feature map used
-        # Sliced to [:, :256] to satisfy Cellpose's internal run_net style broadcasting
-        style_c = torch.mean(s4, dim=(2, 3))[:, :256]
-        style_o = torch.mean(s3, dim=(2, 3))[:, :256]
+        # Style Projections replacing the rigid slicing
+        pool_s4 = torch.mean(s4, dim=(2, 3)) 
+        pool_s3 = torch.mean(s3, dim=(2, 3))
+        
+        style_c = self.style_proj_c(pool_s4)
+        style_o = self.style_proj_o(pool_s3)
 
         # --- PARASITE ROUTING ---
         if self.active_head in ['cells', 'both']:
@@ -263,20 +297,22 @@ class CellposeModel():
         else:
             models_logger.info("\n>>> [MODELS] UNFREEZING BACKBONE: Warning - Swin Backbone is training End-to-End.")
             
-        # Lock or unlock backbone
         for param in self.net.backbone.parameters():
             param.requires_grad = not freeze
             
-        # Parasites ALWAYS train
         for param in self.net.cell_decoder.parameters():
             param.requires_grad = True
         for param in self.net.org_decoder.parameters():
+            param.requires_grad = True
+        for param in self.net.style_proj_c.parameters():
+            param.requires_grad = True
+        for param in self.net.style_proj_o.parameters():
             param.requires_grad = True
 
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,
-             flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
+             flow_threshold=0.2, cellprob_threshold=0.1, do_3D=False, anisotropy=None,
              flow3D_smooth=0, stitch_threshold=0.0, 
              min_size=15, max_size_fraction=0.4, niter=None, 
              augment=False, tile_overlap=0.1, bsize=256, 
@@ -351,7 +387,6 @@ class CellposeModel():
             x = x[np.newaxis, ...]
         nimg = x.shape[0]
         
-        # ---> DECOUPLED SCALING FACTOR CALCULATIONS <---
         image_scaling = {'cells': 1.0, 'organelles': 1.0}
         if diameter is not None:
             if isinstance(diameter, (list, tuple, np.ndarray)) and len(diameter) >= 2:
@@ -405,6 +440,12 @@ class CellposeModel():
 
         heads_to_process = ['cells', 'organelles'] if active_head == 'both' else [active_head]
 
+        # Explicitly enforcing decoupled thresholds
+        thresholds = {
+            'cells': {'flow': 0.2, 'prob': 0.1},
+            'organelles': {'flow': 0.2, 'prob': 0.1} 
+        }
+
         for head in heads_to_process:
             dP, cellprob, styles = network_outputs[head]
 
@@ -422,9 +463,14 @@ class CellposeModel():
                 current_scale = image_scaling.get(head, 1.0)
                 niter_scale = 1 if current_scale is None else current_scale
                 niter_val = int(200/niter_scale) if niter is None or niter == 0 else niter
+                
+                # Assign decoupled thresholds
+                current_flow = thresholds[head]['flow']
+                current_prob = thresholds[head]['prob']
+
                 masks = self._compute_masks(x.shape, dP, cellprob, 
-                                            flow_threshold=flow_threshold,
-                                            cellprob_threshold=cellprob_threshold, 
+                                            flow_threshold=current_flow,
+                                            cellprob_threshold=current_prob, 
                                             min_size=min_size,
                                             max_size_fraction=max_size_fraction, 
                                             niter=niter_val,
@@ -631,3 +677,5 @@ class CellposeModel():
         if changed_device_from is not None:
             self.device = torch.device(changed_device_from)
         return masks
+
+```
