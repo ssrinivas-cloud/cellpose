@@ -208,7 +208,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
     if turnoff_cell_loss:
         train_logger.info(">>> [ABLATION MODE] Cell Loss is turned OFF. Training Organelles only.")
     elif only_cell_loss:
-        train_logger.info(">>> [ABLATION MODE] Organelle Loss is turned OFF. Training Cells only.")
+        train_logger.info(">>> [ABLATION MODE] Organelle Loss is turned OFF. Training Cells only (with Deep Supervision).")
 
     # =================================================================
     # LOSS NORMALIZATION LOGIC
@@ -227,7 +227,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         eff_org_coeff = org_loss_coeff
 
     # =================================================================
-    # PARAMETER FREEZE LOGIC (cell_predict tied to backbone)
+    # PARAMETER FREEZE LOGIC (Deep Supervision & Organelle Protection)
     # =================================================================
     unfreeze_backbone = max(0, min(100, unfreeze_backbone))
     unfreeze_epoch = int((unfreeze_backbone / 100.0) * n_epochs)
@@ -236,19 +236,22 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
 
     if is_frozen:
         if unfreeze_epoch >= n_epochs:
-            train_logger.info(f"\n>>> [MODELS] Backbone & cell_predict will remain PERMANENTLY frozen (unfreeze_backbone={unfreeze_backbone}%).")
+            train_logger.info(f"\n>>> [MODELS] Backbone will remain PERMANENTLY frozen (unfreeze_backbone={unfreeze_backbone}%).")
         else:
-            train_logger.info(f"\n>>> [MODELS] Phase 1: Freezing ViT Backbone & cell_predict. Will unfreeze at Epoch {unfreeze_epoch} ({unfreeze_backbone}%).")
+            train_logger.info(f"\n>>> [MODELS] Phase 1: Freezing ViT Backbone. Will unfreeze at Epoch {unfreeze_epoch} ({unfreeze_backbone}%).")
     else:
         train_logger.info("\n>>> [MODELS] Training Entire Dual-Path Network End-to-End from start (unfreeze_backbone=0%).")
 
     for name, param in net.named_parameters():
-        if any(x in name for x in ['cell_neck', 'cell_out', 'org_neck', 'org_out', 'organelle_transformer', 'intermediate_decoder', 'layer_attention']):
+        # UNFREEZE BOTH CELL HEADS
+        if any(x in name for x in ['cell_neck', 'cell_out', 'cell_predict_neck', 'cell_predict_out']):
             param.requires_grad = True
+        # FORCE FREEZE ORGANELLE HEAD
+        elif any(x in name for x in ['org_neck', 'org_out', 'organelle_transformer', 'intermediate_decoder', 'layer_attention']):
+            param.requires_grad = False
         elif name in ['alpha', 'beta']:
             param.requires_grad = getattr(net, 'learn_volcano', False)
         else:
-            # This implicitly ties cell_predict_neck and cell_predict_out to the encoder's is_frozen state
             param.requires_grad = not is_frozen
 
     trainable_params = filter(lambda p: p.requires_grad, net.parameters())
@@ -383,29 +386,33 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         train_logger.warning(f"Debug plotting failed: {e}")
 
                 # ==========================================================
-                # LOSS CALCULATIONS
+                # LOSS CALCULATIONS (DEEP SUPERVISION)
                 # ==========================================================
-                # 1. PRIMARY CELL HEAD LOSS: Both Prob & Flow computed here now
-                loss_cell, l_prob_c, l_flow_c, l_tv_c = _loss_fn_seg(L_c, y_cell, device)
                 
-                # 2. CELL PREDICT HEAD LOSS: Completely Ignored
-                # y_cell_pred is bypassed. No gradients will backpropagate through cell_predict layers.
+                # 1. Primary Cell Head Loss
+                loss_c1, l_prob_c1, l_flow_c1, _ = _loss_fn_seg(L_c, y_cell, device, flow_weight=0.25)
                 
-                # 3. ORGANELLE HEAD LOSS: Both Prob & Flow
+                # 2. Feedback Cell Predict Head Loss
+                loss_c2, l_prob_c2, l_flow_c2, _ = _loss_fn_seg(L_c, y_cell_pred, device, flow_weight=0.25)
+                
+                # Combine for Deep Supervision
+                loss_cell_total = loss_c1 + loss_c2
+                
+                # 3. Organelle Head Loss
                 loss_org, l_prob_o, l_flow_o, _ = _loss_fn_org(L_o, y_org, device) 
 
                 if only_cell_loss:
-                    loss = loss_cell / accumulation_steps
+                    loss = loss_cell_total / accumulation_steps
                     if debug and k == 0:
-                        train_logger.info(f"[DEBUG-LOSS] CELL ONLY -> Total: {loss_cell.item():.4f} | Prob: {l_prob_c.item():.4f} | Flow: {l_flow_c.item():.4f}")
+                        train_logger.info(f"[DEBUG-LOSS] DEEP SUPERVISION -> Head 1 Loss: {loss_c1.item():.4f} | Head 2 Loss: {loss_c2.item():.4f}")
                 elif turnoff_cell_loss:
                     loss = loss_org / accumulation_steps
                     if debug and k == 0:
                         train_logger.info(f"[DEBUG-LOSS] ORG ONLY -> Total: {loss_org.item():.4f} | Prob: {l_prob_o.item():.4f} | Flow: {l_flow_o.item():.4f}")
                 else:
-                    loss = (eff_cell_coeff * loss_cell + eff_org_coeff * loss_org) / accumulation_steps
+                    loss = (eff_cell_coeff * loss_cell_total + eff_org_coeff * loss_org) / accumulation_steps
                     if debug and k == 0:
-                        train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell Total: {loss_cell.item():.4f} | Org Total: {loss_org.item():.4f}")
+                        train_logger.info(f"[DEBUG-LOSS] DUAL HEAD -> Cell Total: {loss_cell_total.item():.4f} | Org Total: {loss_org.item():.4f}")
 
 
             scaler.scale(loss).backward()
@@ -430,11 +437,12 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
         # AUTO-UNFREEZE TRIGGER
         # =================================================================
         if is_frozen and iepoch >= unfreeze_epoch and unfreeze_epoch < n_epochs:
-            train_logger.info(f"\n>>> [AUTO-UNFREEZE] Milestone Reached (Epoch {iepoch}/{n_epochs} - {unfreeze_backbone}%). UNFREEZING WHOLE BACKBONE & CELL_PREDICT FOR FINE-TUNING!")
+            train_logger.info(f"\n>>> [AUTO-UNFREEZE] Milestone Reached (Epoch {iepoch}/{n_epochs} - {unfreeze_backbone}%). UNFREEZING WHOLE BACKBONE FOR FINE-TUNING!")
             
             newly_unfrozen_params = []
             for name, param in net.named_parameters(): 
-                if not param.requires_grad:
+                # Keep organelle head frozen even when backbone unfreezes
+                if not param.requires_grad and not any(x in name for x in ['org_neck', 'org_out', 'organelle_transformer', 'intermediate_decoder', 'layer_attention']):
                     param.requires_grad = True
                     newly_unfrozen_params.append(param)
             
@@ -470,19 +478,21 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                                 y_cell, y_org, y_cell_pred = outputs
                             elif len(outputs) == 2:
                                 y_cell, y_org = outputs
+                                y_cell_pred = y_cell
                                 
-                            # 1. Primary Cell Head Loss (Prob & Flow)
-                            loss_cell, _, _, _ = _loss_fn_seg(L_c, y_cell, device)
+                            # Deep Supervision Validation Loss
+                            loss_c1, _, _, _ = _loss_fn_seg(L_c, y_cell, device, flow_weight=0.25)
+                            loss_c2, _, _, _ = _loss_fn_seg(L_c, y_cell_pred, device, flow_weight=0.25)
+                            loss_cell_total = loss_c1 + loss_c2
                             
-                            # 2. Organelle Head Loss
                             loss_org, _, _, _ = _loss_fn_org(L_o, y_org, device) 
                             
                             if only_cell_loss:
-                                loss = loss_cell
+                                loss = loss_cell_total
                             elif turnoff_cell_loss:
                                 loss = loss_org
                             else:
-                                loss = eff_cell_coeff * loss_cell + eff_org_coeff * loss_org
+                                loss = eff_cell_coeff * loss_cell_total + eff_org_coeff * loss_org
                         
                         lavgt += loss.item() * len(imgi)
                 lavgt /= nimg_test
@@ -561,7 +571,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         axes[1, 1].axis('off')
                         
                         plt.tight_layout()
-                        plt.show()  # Display directly in Jupyter Notebook
+                        plt.show()  
                     except Exception as e:
                         train_logger.warning(f"Post-processed overlay execution block errored: {e}")
                 
