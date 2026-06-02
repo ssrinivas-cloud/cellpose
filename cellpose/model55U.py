@@ -375,9 +375,14 @@ class DualPathTransformer(nn.Module):
         # =========================================================
         # SPATIAL ATTENTION: Suppress the ambiguous background
         # =========================================================
-        # Executed during both training & eval for Deep Supervision
         prob_map = torch.sigmoid(out_c_pass1[:, 2:3, :, :])
-        x_feedback = x * prob_map
+        
+        if self.training:
+            # ---> THE FIREWALL <---
+            # .detach() stops gradients from Pass 2 bleeding into Pass 1 and causing checkerboards!
+            x_feedback = x * prob_map.detach() 
+        else:
+            x_feedback = x * prob_map
         
         # =========================================================
         # PASS 2: Feedback Cell Head & Organelles
@@ -404,13 +409,13 @@ class DualPathTransformer(nn.Module):
         out_o = self.pixel_shuffle(self.org_out(feat_o))
         style_o = torch.mean(feat_o, dim=(2, 3))
 
-        # Ensure we return all 3 tensors so Deep Supervision works!
+        # Ensure we return all 3 tensors for Deep Supervision
         if self.active_head == 'cells':
             return (out_c_pass1, out_c), style_c 
         elif self.active_head == 'organelles':
             return out_o, style_o
         else:
-            return (out_c_pass1, out_o, out_c), (style_c, style_o) 
+            return (out_c_pass1, out_o, out_c), (style_c, style_o)
 
 
 class CellposeModel():
