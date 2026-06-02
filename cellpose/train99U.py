@@ -24,7 +24,7 @@ train_logger = logging.getLogger(__name__)
 
 def focal_loss_with_logits(pred_logits, target_mask, alpha=0.25, gamma=2.0, reduction='mean'):
     """
-    Focal Loss to combat severe class imbalance (Background vs Foreground).
+    Standard Focal Loss (used for Organelles).
     """
     bce_loss = F.binary_cross_entropy_with_logits(pred_logits, target_mask, reduction='none')
     pt = torch.exp(-bce_loss) 
@@ -56,8 +56,8 @@ def dice_loss(pred_logits, target_mask, smooth=1e-5):
     dice = (2. * intersection + smooth) / (union + smooth)
     return 1.0 - dice
 
-def _loss_fn_seg(lbl, y, device, flow_weight=0.25, bce_weight=1.0, dice_weight=2.0, tv_weight=0.005):
-    # NOTE: flow_weight reduced to 0.25 by default to prevent chaotic brightfield flows from dominating
+def _loss_fn_seg(lbl, y, device, flow_weight=0.25, bce_weight=1.0, dice_weight=5.0, tv_weight=0.005):
+    # NOTE: dice_weight bumped to 5.0 to encourage full cell body prediction
     criterion_mse = nn.MSELoss(reduction="mean")
     
     veci = 5. * lbl[:, -2:] # GT Cell Flows
@@ -67,8 +67,27 @@ def _loss_fn_seg(lbl, y, device, flow_weight=0.25, bce_weight=1.0, dice_weight=2
     pred_logits = y[:, -1]
     
     loss_flow = criterion_mse(pred_flows, veci)
-    # NOTE: gamma updated to 3.0 to brutally penalize ambiguous brightfield halos!
-    loss_focal = focal_loss_with_logits(pred_logits, target_mask, alpha=0.25, gamma=3.0)
+    
+    # ---> CUSTOM BRIGHTFIELD FOCAL LOSS WITH SMOOTHED EDGE WEIGHTING <---
+    bce_loss = F.binary_cross_entropy_with_logits(pred_logits, target_mask, reduction='none')
+    pt = torch.exp(-bce_loss) 
+    # gamma=3.0 to heavily penalize ambiguous brightfield halos
+    focal_loss_map = 0.25 * (1 - pt)**3.0 * bce_loss
+    
+    # 1. Find the hard edges
+    laplacian_kernel = torch.tensor([[[[-1., -1., -1.], [-1., 8., -1.], [-1., -1., -1.]]]]).to(device)
+    hard_edges = F.conv2d(target_mask.unsqueeze(1), laplacian_kernel, padding=1)
+    hard_edges = (torch.abs(hard_edges) > 0).float()
+    
+    # 2. Blur the edges to create a "forgiveness zone"
+    forgiveness_zone = F.avg_pool2d(hard_edges, kernel_size=5, stride=1, padding=2)
+    
+    # 3. Create the weight map (Scale is 1.0 to 4.0)
+    edge_weight_map = 1.0 + 3.0 * (forgiveness_zone / (forgiveness_zone.max() + 1e-8))
+    
+    loss_focal = (focal_loss_map * edge_weight_map.squeeze(1)).mean()
+    # ---------------------------------------------------------------------
+
     loss_dice = dice_loss(pred_logits, target_mask)
     loss_tv = total_variation_loss(pred_flows)
     
@@ -366,10 +385,10 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 # ==========================================================
                 
                 # 1. Primary Cell Head Loss
-                loss_c1, l_prob_c1, l_flow_c1, _ = _loss_fn_seg(L_c, y_cell, device, flow_weight=0.25)
+                loss_c1, l_prob_c1, l_flow_c1, _ = _loss_fn_seg(L_c, y_cell, device, flow_weight=0.25, dice_weight=5.0)
                 
                 # 2. Feedback Cell Predict Head Loss
-                loss_c2, l_prob_c2, l_flow_c2, _ = _loss_fn_seg(L_c, y_cell_pred, device, flow_weight=0.25)
+                loss_c2, l_prob_c2, l_flow_c2, _ = _loss_fn_seg(L_c, y_cell_pred, device, flow_weight=0.25, dice_weight=5.0)
                 
                 # Combine for Deep Supervision
                 loss_cell_total = loss_c1 + loss_c2
@@ -457,8 +476,8 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                                 y_cell_pred = y_cell
                                 
                             # Deep Supervision Validation Loss
-                            loss_c1, _, _, _ = _loss_fn_seg(L_c, y_cell, device, flow_weight=0.25)
-                            loss_c2, _, _, _ = _loss_fn_seg(L_c, y_cell_pred, device, flow_weight=0.25)
+                            loss_c1, _, _, _ = _loss_fn_seg(L_c, y_cell, device, flow_weight=0.25, dice_weight=5.0)
+                            loss_c2, _, _, _ = _loss_fn_seg(L_c, y_cell_pred, device, flow_weight=0.25, dice_weight=5.0)
                             loss_cell_total = loss_c1 + loss_c2
                             
                             loss_org, _, _, _ = _loss_fn_org(L_o, y_org, device) 
