@@ -185,7 +185,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
               unfreeze_backbone=50, test_result=10, normalize_loss=False, 
               turnoff_cell_loss=False, only_cell_loss=False, 
               two_tail=False, cell_loss_coeff=1.0, org_loss_coeff=1.0, 
-              zoom_out_factor=0.8, **kwargs):
+              zoom_out_factor=0.5, **kwargs):
     
     device = net.device
     original_net_dtype = net.dtype 
@@ -294,7 +294,7 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
             
             # --- THE ZOOM OUT FIX ---
             base_rsc = diams / net.diam_mean.item() if rescale else np.ones(len(diams), "float32")
-            rsc = base_rsc * zoom_out_factor
+            rsc = base_rsc * zoom_out_factor 
             # ------------------------
             
             lbls_stacked = [np.concatenate((lbls_c[i], lbls_o[i]), axis=0) for i in range(len(inds))]
@@ -552,30 +552,46 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                 net.save_model(temp_model_path)
                 eval_model = model55U.CellposeModel(gpu=True, custom_weights=temp_model_path, use_bfloat16=False, nchan=(6 if two_tail else 3))
                 
-                masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
-                pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
-                gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
+                # ---> THE MONKEY PATCH: HIDE DEEP SUPERVISION FROM EVAL <---
+                # model55U expects a single concatenated 6-channel tensor, not a tuple
+                original_forward = eval_model.net.forward
                 
-                n_cells_pred = pred_cells[0].max() if np.any(pred_cells[0]) else 0
-                n_orgs_pred = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
-                n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
-                n_orgs_gt = gt_orgs[0].max() if np.any(gt_orgs[0]) else 0
-                
-                train_logger.info(f"--- [DEBUG] Full Image Counts -> CELLS: Pred {n_cells_pred} (GT {n_cells_gt}) | ORGS: Pred {n_orgs_pred} (GT {n_orgs_gt}) ---")
-                
-                def calc_metrics(gt_masks, pred_masks):
-                    tp = fp = fn = 0
-                    for gt, pred in zip(gt_masks, pred_masks):
-                        gt_bin, pred_bin = gt > 0, pred > 0
-                        tp += np.logical_and(gt_bin, pred_bin).sum()
-                        fp += np.logical_and(~gt_bin, pred_bin).sum()
-                        fn += np.logical_and(gt_bin, ~pred_bin).sum()  
-                    return tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
-                
-                train_logger.info(f"--- [DEBUG] Test IOU -> CELLS: {calc_metrics(gt_cells, pred_cells):.4f} | ORGANELLES: {calc_metrics(gt_orgs, pred_orgs):.4f} ---")
+                def patched_forward(x, **kwargs):
+                    out, style = original_forward(x, **kwargs)
+                    if isinstance(out, (list, tuple)):
+                        if len(out) >= 2:
+                            # Glue Head 1 (Cells) and Head 2/3 (Organelles) back together along the channel dimension
+                            glued_out = torch.cat([out[0], out[1]], dim=1)
+                            return glued_out, style
+                    return out, style
+                    
+                eval_model.net.forward = patched_forward
+                # -----------------------------------------------------------
 
-                if visualize:
-                    try:
+                try:
+                    masks_both, _, _ = eval_model.eval(test_data, batch_size=2, channels=[0,0], cellprob_threshold=0.0, rescale=1.0, active_head='both')
+                    pred_cells, pred_orgs = [m[0] for m in masks_both], [m[1] for m in masks_both]
+                    gt_cells, gt_orgs = [t[0] for t in test_flows_c], [t[0] for t in test_flows_o]
+                    
+                    n_cells_pred = pred_cells[0].max() if np.any(pred_cells[0]) else 0
+                    n_orgs_pred = pred_orgs[0].max() if np.any(pred_orgs[0]) else 0
+                    n_cells_gt = gt_cells[0].max() if np.any(gt_cells[0]) else 0
+                    n_orgs_gt = gt_orgs[0].max() if np.any(gt_orgs[0]) else 0
+                    
+                    train_logger.info(f"--- [DEBUG] Full Image Counts -> CELLS: Pred {n_cells_pred} (GT {n_cells_gt}) | ORGS: Pred {n_orgs_pred} (GT {n_orgs_gt}) ---")
+                    
+                    def calc_metrics(gt_masks, pred_masks):
+                        tp = fp = fn = 0
+                        for gt, pred in zip(gt_masks, pred_masks):
+                            gt_bin, pred_bin = gt > 0, pred > 0
+                            tp += np.logical_and(gt_bin, pred_bin).sum()
+                            fp += np.logical_and(~gt_bin, pred_bin).sum()
+                            fn += np.logical_and(gt_bin, ~pred_bin).sum()  
+                        return tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0
+                    
+                    train_logger.info(f"--- [DEBUG] Test IOU -> CELLS: {calc_metrics(gt_cells, pred_cells):.4f} | ORGANELLES: {calc_metrics(gt_orgs, pred_orgs):.4f} ---")
+
+                    if visualize:
                         fig, axes = plt.subplots(2, 2, figsize=(16, 16))
                         fig.suptitle(f"Epoch {iepoch} - Post-Processed Mask Reconstructions", fontsize=18, y=0.98)
                         
@@ -611,11 +627,16 @@ def train_seg(net, train_data=None, train_labels_c=None, train_labels_o=None,
                         
                         plt.tight_layout()
                         plt.show()  
-                    except Exception as e:
-                        train_logger.warning(f"Post-processed overlay execution block errored: {e}")
+
+                except Exception as e:
+                    train_logger.error(f"Post-processing evaluation crashed: {e}")
+                    train_logger.warning("Skipping visualization to protect training loop.")
                 
-                del eval_model
-                torch.cuda.empty_cache()
+                finally:
+                    # ALWAYS clean up the patch and memory so the next epoch trains normally
+                    eval_model.net.forward = original_forward
+                    del eval_model
+                    torch.cuda.empty_cache()
 
         lavg /= nsum
         train_logger.info(f"Epoch {iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s")
